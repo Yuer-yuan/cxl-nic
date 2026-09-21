@@ -4,3 +4,4 @@ __pycache__/
 results/
 audit/
 docs/design/
+build/

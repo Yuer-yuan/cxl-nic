@@ -35,10 +35,11 @@ from pathlib import Path
 import sys
 
 run = Path(sys.argv[1])
-files = [Path('.gitignore'), Path('README.md')]
-for directory in ('cxl_nic', 'tests', 'scripts'):
+files = [Path('.gitignore'), Path('.gitmodules'), Path('README.md')]
+for directory in ('cxl_nic', 'tests', 'scripts', 'guest'):
     files.extend(p for p in Path(directory).rglob('*')
-                 if p.is_file() and '__pycache__' not in p.parts and p.suffix in ('.py', '.sh'))
+                 if p.is_file() and '__pycache__' not in p.parts
+                 and p.suffix in ('.py', '.sh', '.c', '.S', '.ld'))
 manifest = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(files)}
 result = json.loads((run / 'verification/result.json').read_text())
 evidence = {'status': result['status'], 'source_sha256': manifest,

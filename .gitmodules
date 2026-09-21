@@ -1,0 +1,6 @@
+[submodule "thirdparty/qemu"]
+	path = thirdparty/qemu
+	url = git@github.com:Yuer-yuan/qemu-cxl-type2.git
+[submodule "thirdparty/cxlmemsim"]
+	path = thirdparty/cxlmemsim
+	url = git@github.com:Yuer-yuan/CXLMemSim.git

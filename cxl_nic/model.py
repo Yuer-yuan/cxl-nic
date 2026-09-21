@@ -259,6 +259,22 @@ class Protocol:
 
     def acquire(self, flow: int) -> Optional[Delivery]:
         """Abstract acquire: snapshot actual host bytes after matching ready."""
+        return self._acquire(flow)
+
+    def observe_consumption(self, flow: int, descriptor: dict, payload: bytes) -> Delivery:
+        """Record an external CPU's observation without replacing it with model data.
+
+        The transport must complete writes before observations can be accepted.
+        The independent checker compares the observed bytes/metadata with ingress.
+        """
+        if not isinstance(descriptor, dict) or not isinstance(payload, bytes):
+            raise ProtocolError("external observation requires a descriptor dict and bytes")
+        delivery = self._acquire(flow, (descriptor, payload))
+        if delivery is None:
+            raise ProtocolError("external CPU consumed before modeled publication")
+        return delivery
+
+    def _acquire(self, flow: int, observation=None) -> Optional[Delivery]:
         state = self._flow(flow)
         packet = state.packets.get(state.next_consume)
         if packet is None:
@@ -268,11 +284,11 @@ class Protocol:
             return None
         if packet.phase != "READY":
             raise ProtocolError("ready marker without published ownership")
-        descriptor = dict(host.descriptor)
+        descriptor = dict(host.descriptor if observation is None else observation[0])
         length = descriptor.get("length", 0)
         if type(length) is not int or not 1 <= length <= self.config.max_packet_bytes:
             raise ProtocolError("invalid visible descriptor length")
-        payload = bytes(host.data[:length])
+        payload = bytes(host.data[:length]) if observation is None else observation[1]
         packet.phase = "CPU_OWNED"
         state.next_consume += 1
         self._emit("consume", token=asdict(packet.token), descriptor=descriptor, payload=payload.hex())
