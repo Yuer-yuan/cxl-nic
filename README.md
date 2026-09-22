@@ -64,6 +64,7 @@ python3 -m cxl_nic.integration --device-type type2 --data-path ncp \
     --host-llc-sets 64 --host-llc-ways 8 --output results/integration-ncp-001
 python3 -m cxl_nic.integration --device-type type2 --data-path ddio \
     --host-llc-sets 64 --host-llc-ways 8 --output results/integration-ddio-001
+bash scripts/verify_integration_cache.sh results/integration-cache-matrix-001
 ```
 
 In NC-P mode, QEMU registers its Type2 connection as the host requester and
@@ -79,6 +80,13 @@ DDIO implementation. Results report completion, all host read hits, first-demand
 hits, evictions, writebacks and residency. `--data-path legacy` remains the default
 regression path. These are executable simulator mechanisms and do not manipulate a
 physical QEMU host cache.
+
+The matrix command runs both paths with the default 64-set/eight-way LLC and a
+one-set/one-way pressure case. It requires identical cache-injection work,
+complete first-demand hits with the default geometry, misses under pressure,
+dirty NC-P writeback, and clean DDIO eviction. Pressure hit and eviction counts
+can vary with guest polling, so they are recorded without requiring equality;
+latency comparisons use the deterministic timing model below.
 
 Omit `--install-deps` when the build dependencies are already installed. Use
 `JOBS=8` to set build parallelism. No guest Linux image is required.
@@ -223,6 +231,10 @@ python3 -m cxl_nic.timing --output results/timing-custom-001 \
 
 The model uses one fixed session, sender-provided packet sequence numbers and
 explicit epochs, complete packets, per-flow delivery and reserved per-flow credits.
+The NIC reorder stage, rather than either cache-injection operation, enforces packet
+order and publishes only a contiguous per-flow prefix. The current scope assumes
+reliable eventual delivery of every complete packet with finite reordering; loss
+recovery is a later layer.
 `complete(op_id)` means a write has become CPU-visible. Atomic ready markers and
 CPU acquire are abstract operations whose hardware implementation remains to be
 validated. Missing packets stall the flow; explicit gap failure terminates it
