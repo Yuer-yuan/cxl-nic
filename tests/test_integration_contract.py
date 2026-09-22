@@ -41,6 +41,18 @@ class GuestPatternTests(unittest.TestCase):
             with self.subTest(data_path=data_path), self.assertRaisesRegex(ValueError, "Type2"):
                 run_case(*arguments, device_type="type3", data_path=data_path)
 
+    def test_post_push_nc_write_is_scoped_to_adversarial_ncp(self):
+        arguments = (None, None, None, None, None, "adversarial", 4, 1)
+        with self.assertRaisesRegex(ValueError, "ncp_post_push"):
+            run_case(*arguments, device_type="type2", data_path="ncp", ncp_post_push="invalid")
+        with self.assertRaisesRegex(ValueError, "adversarial NC-P"):
+            run_case(*arguments, device_type="type2", data_path="ddio",
+                     ncp_post_push="before-ready")
+        other = (*arguments[:5], "early-ready", *arguments[6:])
+        with self.assertRaisesRegex(ValueError, "adversarial NC-P"):
+            run_case(*other, device_type="type2", data_path="ncp",
+                     ncp_post_push="before-ready")
+
     def test_pattern_golden_vectors_cover_endianness_flow_and_partial_word(self):
         vectors = (
             ((0, 0, 0, 16), "0000000000000000737a5367a08f5ab5"),

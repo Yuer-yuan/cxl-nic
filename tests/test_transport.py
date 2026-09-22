@@ -156,6 +156,21 @@ class TransportTests(unittest.TestCase):
                 client.ddio_write(address, payload)
         self.assertEqual(stream.sent, [])
 
+    def test_post_push_nc_write_uses_dedicated_operation_and_counts_bytes(self):
+        client, stream = self.make_client([response(), response()])
+        client.ncp_nc_write(64, b"withdraw")
+        client.ncp_nc_write(96, b"x")
+        self.assertEqual([request[0] for request in stream.sent], [26, 26])
+        self.assertEqual((client.ncp_nc_writes, client.ncp_nc_write_bytes), (2, 9))
+
+    def test_post_push_nc_write_rejects_invalid_data_before_sending(self):
+        client, stream = self.make_client()
+        for address, payload in ((0, b""), (0, bytearray(b"x")), (63, b"xx"),
+                                 (128, b"x"), (-1, b"x")):
+            with self.subTest(address=address, payload=payload), self.assertRaises(ValueError):
+                client.ncp_nc_write(address, payload)
+        self.assertEqual(stream.sent, [])
+
     def test_host_llc_traffic_query_preserves_backing_home(self):
         counters = (128, 192, 64, 128, 0, 256, 320, 0)
         client, stream = self.make_client([response(struct.pack("<8Q", *counters))])

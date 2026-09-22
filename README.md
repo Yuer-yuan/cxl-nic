@@ -83,9 +83,11 @@ regression path. These are executable simulator mechanisms and do not manipulate
 physical QEMU host cache.
 
 The matrix command runs both paths with the default 64-set/eight-way LLC and a
-one-set/one-way pressure case. It requires identical cache-injection work,
+one-set/one-way pressure case, plus an NC-P arm that issues payload NC-writes
+after push completion and before ready publication. It requires identical cache-injection work,
 complete first-demand hits with the default geometry, misses under pressure,
-dirty NC-P writeback, and clean DDIO eviction. Pressure hit and eviction counts
+dirty NC-P writeback, clean DDIO eviction, and NIC-backing fallback after the
+post-push withdrawal. Pressure hit and eviction counts
 can vary with guest polling, so they are recorded without requiring equality;
 latency comparisons use the deterministic timing model below.
 

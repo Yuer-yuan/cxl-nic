@@ -8,30 +8,35 @@ from cxl_nic.integration_matrix import ARMS, compare_results
 
 
 def result(name):
-    path, sets, ways, case_selection = ARMS[name]
+    path, sets, ways, case_selection, post_push = ARMS[name]
     pressure = name.endswith("pressure")
-    misses = 218 if pressure else 0
+    withdraw = name == "ncp_withdraw"
+    misses = 188 if withdraw else (218 if pressure else 0)
     writebacks = 220 if pressure and path == "ncp" else 0
+    nc_writes = 188 if withdraw else 0
     home = "nic" if path == "ncp" else "host"
     other = "host" if path == "ncp" else "nic"
     cases = [{"mode": "adversarial", "status": "passed",
               path: {"configured_sets": sets, "configured_ways": ways,
                      "pushes": 220, "push_bytes": 12288, "first_demands": 220,
-                     "first_demand_hits": 2 if pressure else 220,
+                     "first_demand_hits": 220 - misses,
                      "first_demand_misses": misses,
                      "evictions": 900 if pressure else 1,
                      "writebacks": writebacks,
                      "resident": 1 if pressure else 128,
+                     "nc_writes": nc_writes,
+                     "nc_write_bytes": 12032 if withdraw else 0,
                      "backing_read_bytes": {home: misses * 64, other: 0},
                      "first_demand_backing_bytes": {home: misses * 64, other: 0},
                      "dirty_writeback_bytes": {home: writebacks * 64, other: 0},
                      "producer_backing_write_bytes":
-                         {"host": 220 * 64 if path == "ddio" else 0, "nic": 0}}}]
+                         {"host": 220 * 64 if path == "ddio" else 0,
+                          "nic": nc_writes * 64}}}]
     if case_selection == "all":
         cases.extend(({"mode": "early-ready", "status": "expected_rejection"},
                       {"mode": "corrupt-payload", "status": "expected_rejection"}))
     return {"status": "passed", "device_type": "type2", "data_path": path,
-            "pins": dict(PINS), "cases": cases}
+            "ncp_post_push": post_push, "pins": dict(PINS), "cases": cases}
 
 
 class IntegrationMatrixTests(unittest.TestCase):
@@ -80,6 +85,15 @@ class IntegrationMatrixTests(unittest.TestCase):
     def test_rejects_ddio_without_host_backing_write(self):
         self.stats("ddio_default")["producer_backing_write_bytes"]["host"] = 0
         with self.assertRaisesRegex(ValueError, "producer backing traffic"):
+            compare_results(self.results)
+
+    def test_rejects_post_push_without_payload_fallback(self):
+        stats = self.stats("ncp_withdraw")
+        stats["first_demand_hits"] = 220
+        stats["first_demand_misses"] = 0
+        stats["first_demand_backing_bytes"]["nic"] = 0
+        stats["backing_read_bytes"]["nic"] = 0
+        with self.assertRaisesRegex(ValueError, "post-push NC-write"):
             compare_results(self.results)
 
     def test_rejects_inconsistent_first_demand_accounting(self):

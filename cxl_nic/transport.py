@@ -15,6 +15,7 @@ OP_NCP_QUERY = 22
 OP_DDIO_WRITE = 23
 OP_DDIO_QUERY = 24
 OP_HOST_LLC_TRAFFIC_QUERY = 25
+OP_NCP_NC_WRITE = 26
 
 
 class TransportError(RuntimeError):
@@ -30,6 +31,8 @@ class Client:
         self.reads = 0
         self.writes = 0
         self.ncp_writes = 0
+        self.ncp_nc_writes = 0
+        self.ncp_nc_write_bytes = 0
         self.ddio_writes = 0
 
     def close(self):
@@ -120,6 +123,13 @@ class Client:
             raise ValueError("DDIO write requires nonempty bytes")
         self._request(OP_DDIO_WRITE, address, len(data), data)
         self.ddio_writes += 1
+
+    def ncp_nc_write(self, address, data):
+        if not isinstance(data, bytes) or not data:
+            raise ValueError("NC-write requires nonempty bytes")
+        self._request(OP_NCP_NC_WRITE, address, len(data), data)
+        self.ncp_nc_writes += 1
+        self.ncp_nc_write_bytes += len(data)
 
     def _query_host_llc(self, operation):
         latency, resident, data = self._exchange(operation)
