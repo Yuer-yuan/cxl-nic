@@ -51,7 +51,9 @@ class WorkloadTests(unittest.TestCase):
                          "background_working_set_lines": 0},
                         {"packet_stride_lines": 27},
                         {"ncp_ways": (0, 0)}, {"ddio_ways": (8,)},
-                        {"ncp_withdraw_ns": -1}):
+                        {"ncp_withdraw_ns": -1},
+                        {"ncp_gate_resident_lines": -1},
+                        {"ncp_gate_resident_lines": True}):
             with self.subTest(changes=changes), self.assertRaises(TimingError):
                 config(**changes)
 
@@ -144,6 +146,43 @@ class TimingPolicyTests(unittest.TestCase):
         self.assertEqual(withdrawn["payload_first_demand"]["misses"], 1)
         self.assertEqual(withdrawn["withdrawn_payload_lines"], 1)
 
+    def test_adaptive_gate_endpoints_and_mixed_choice_preserve_delivery(self):
+        workload = tuple(packet(serial, 0) for serial in range(4))
+        all_nc_write = Simulation(
+            workload, "D1-gated", config(ncp_gate_resident_lines=0)).run()
+        mixed = Simulation(
+            workload, "D1-gated", config(ncp_gate_resident_lines=1)).run()
+        all_ncp = Simulation(
+            workload, "D1-gated", config(ncp_gate_resident_lines=513)).run()
+        baseline = Simulation(
+            workload, "D1", config(ncp_gate_resident_lines=513)).run()
+        lines = all_nc_write["payload_first_demand"]["lines"]
+        self.assertEqual(all_nc_write["adaptive_gate"],
+                         {"threshold_resident_lines": 0,
+                          "ncp_lines": 0, "nc_write_lines": lines,
+                          "nc_write_bytes": lines * 64})
+        self.assertEqual(all_nc_write["payload_first_demand"]["misses"], lines)
+        self.assertGreater(mixed["adaptive_gate"]["ncp_lines"], 0)
+        self.assertGreater(mixed["adaptive_gate"]["nc_write_lines"], 0)
+        self.assertEqual(all_ncp["adaptive_gate"],
+                         {"threshold_resident_lines": 513,
+                          "ncp_lines": lines, "nc_write_lines": 0,
+                          "nc_write_bytes": 0})
+        expected = [0, 1, 2, 3]
+        for result in (all_nc_write, mixed, all_ncp):
+            self.assertEqual([item["serial"] for item in result["delivery_order"]], expected)
+        for key in ("duration_ns", "delivery_latency_ns", "sequence_wait_ns",
+                    "push_to_first_demand_ns", "payload_first_demand", "link_bytes",
+                    "producer_link_bytes", "cpu_nic_read_bytes", "payload_push_bytes",
+                    "credit_stall_ns", "packet_records", "cache_before_final_flush"):
+            with self.subTest(key=key):
+                self.assertEqual(all_ncp[key], baseline[key])
+
+    def test_adaptive_gate_and_post_push_withdrawal_are_separate_policies(self):
+        with self.assertRaisesRegex(TimingError, "separate policies"):
+            Simulation((packet(0, 0),), "D1-gated",
+                       config(ncp_withdraw_ns=0)).run()
+
     def test_no_allocate_exposes_host_vs_nic_fallback_cost(self):
         workload = (packet(0, 0, 65),)
         cfg = config(ddio_ways=(), ncp_ways=())
@@ -171,8 +210,8 @@ class TimingPolicyTests(unittest.TestCase):
     def test_unknown_policy_is_rejected(self):
         with self.assertRaisesRegex(TimingError, "unknown policy"):
             Simulation((packet(0, 0),), "not-a-policy", config())
-        self.assertEqual(set(POLICIES), {"A", "B0", "B1", "C", "D0", "D1", "E",
-                                         "D1-host-control"})
+        self.assertEqual(set(POLICIES), {"A", "B0", "B1", "C", "D0", "D1",
+                                         "D1-gated", "E", "D1-host-control"})
 
 
 if __name__ == "__main__":

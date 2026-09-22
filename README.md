@@ -205,6 +205,8 @@ and link parameters for every arm:
 - `C`: arrival-time NC-P hypothesis, with ordered publication to the CPU.
 - `D0`: NIC reorder followed by an unrestricted contiguous NC-P burst.
 - `D1`: NIC reorder followed by credit-limited delayed NC-P.
+- `D1-gated`: D1 with a resident-line threshold that chooses NC-P below the
+  threshold and NC-write to NIC backing at or above it.
 - `E`: NIC reorder and ordered publication without payload push; CPU demand fetches
   from NIC memory.
 - `D1-host-control`: the D1 scheduler with host backing, used only to prove that a
@@ -213,12 +215,17 @@ and link parameters for every arm:
 All times are integer virtual nanoseconds. The engine models a serialized 64-byte
 link, propagation latency, a single CPU consumer, per-flow push credit, finite NIC
 buffering, a finite CPU software reorder buffer for arm A, the shared LLC, optional
-periodic background references and optional post-push NC-write withdrawal. A
+periodic background references, optional post-push NC-write withdrawal, and an
+adaptive NC-P/NC-write gate. The gate samples whole-cache occupancy when each
+payload line becomes visible; its threshold is a sensitivity parameter rather
+than a calibrated hardware signal. A
 NIC-home CPU miss consumes return-link bandwidth and waits behind queued producer
 traffic. Host and NIC backing service times are separate parameters.
 
 The verification script runs the full matrix plus gap-delay, LLC pressure, I/O way
-admission, NC-write withdrawal, tight-credit and packet-stride cases. Packet stride
+admission, NC-write withdrawal, tight-credit, packet-stride and adaptive-gate
+threshold cases. Gate thresholds cover all NC-write, mixed placement and all NC-P;
+the all-NC-P endpoint must be identical to D1. Packet stride
 is expressed in cache lines; 128 and 129 line strides expose sensitivity to the
 model's simple modulo set mapping. It records ordered-delivery p50/p99 latency,
 first payload-line hit rate, push-to-demand distance, premature absence, credit

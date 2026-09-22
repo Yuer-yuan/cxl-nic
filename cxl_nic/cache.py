@@ -237,6 +237,10 @@ class Cache:
         base = self._address(address)
         return self._find(base)[1] is not None
 
+    def resident_lines(self):
+        """Return current whole-cache occupancy without exposing line contents."""
+        return sum(line is not None for lines in self._sets for line in lines)
+
     def flush(self):
         """Write back dirty lines without invalidating or resetting statistics."""
         for lines in self._sets:
@@ -258,4 +262,5 @@ class Cache:
         ]
         return {"sets": self.sets, "ways": self.ways, "line_bytes": LINE_BYTES,
                 "capacity_bytes": self.sets * self.ways * LINE_BYTES,
-                "occupancy": len(lines), "lines": lines, "stats": deepcopy(self._stats)}
+                "occupancy": self.resident_lines(), "lines": lines,
+                "stats": deepcopy(self._stats)}

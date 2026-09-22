@@ -171,6 +171,15 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(current["stats"]["reads"]["payload"]["hits"], 0)
         self.assertEqual(current["lines"][0]["address"], 0)
 
+    def test_resident_line_count_tracks_all_sets_without_snapshotting(self):
+        cache = self.cache(sets=2, ways=2)
+        self.assertEqual(cache.resident_lines(), 0)
+        cache.read(0, 1)
+        cache.io_write(64, b"N" * 64, (0, 1))
+        self.assertEqual(cache.resident_lines(), 2)
+        cache.bypass_write(64, b"B" * 64)
+        self.assertEqual(cache.resident_lines(), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

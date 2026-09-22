@@ -66,6 +66,7 @@ class Policy:
     use_credit: bool
     push_payload: bool = True
     cpu_reorder: bool = False
+    adaptive_ncp_gate: bool = False
 
     def __post_init__(self):
         if self.family not in ("ddio", "ncp", "demand"):
@@ -74,6 +75,8 @@ class Policy:
             raise TimingError("policy home must be host or nic")
         if not isinstance(self.name, str) or not self.name:
             raise TimingError("policy name must be nonempty")
+        if self.adaptive_ncp_gate and (self.family != "ncp" or not self.push_payload):
+            raise TimingError("adaptive NC-P gating requires a payload-pushing NC-P policy")
 
 
 POLICIES = {
@@ -83,6 +86,8 @@ POLICIES = {
     "C": Policy("C", "ncp", "nic", False, False),
     "D0": Policy("D0", "ncp", "nic", True, False),
     "D1": Policy("D1", "ncp", "nic", True, True),
+    "D1-gated": Policy("D1-gated", "ncp", "nic", True, True,
+                       adaptive_ncp_gate=True),
     "E": Policy("E", "demand", "nic", True, True, False),
     # Same mechanism and host backing as B1.  It is a mandatory label-invariance
     # control, not an additional architectural proposal.
@@ -109,6 +114,7 @@ class TimingConfig:
     background_interval_ns: int | None = None
     background_working_set_lines: int = 0
     ncp_withdraw_ns: int | None = None
+    ncp_gate_resident_lines: int = 32
     max_time_ns: int = 10_000_000
 
     def __post_init__(self):
@@ -129,6 +135,9 @@ class TimingConfig:
             raise TimingError("packet_stride_lines cannot fit metadata and a 1500-byte packet")
         if type(self.background_working_set_lines) is not int or self.background_working_set_lines < 0:
             raise TimingError("background_working_set_lines must be nonnegative")
+        if (type(self.ncp_gate_resident_lines) is not int
+                or self.ncp_gate_resident_lines < 0):
+            raise TimingError("ncp_gate_resident_lines must be a nonnegative integer")
         if (self.background_working_set_lines == 0) != (self.background_interval_ns is None):
             raise TimingError("background interval and working set must be enabled together")
         for name in ("ddio_ways", "ncp_ways"):
@@ -296,6 +305,8 @@ class Simulation:
         self.first_misses = 0
         self.admitted_absent = 0
         self.withdrawals = 0
+        self.gated_ncp_lines = 0
+        self.gated_nc_write_lines = 0
         self.delivered = []
         self.demand_records = []
         for state in self.states.values():
@@ -429,13 +440,24 @@ class Simulation:
 
     def _payload_visible(self, now, state, offset, data):
         address = state.base + PAYLOAD_OFFSET + offset
-        self.cache.io_write(address, data, self.admission)
+        placement = self.policy.family
+        if (self.policy.adaptive_ncp_gate
+                and self.cache.resident_lines() >= self.config.ncp_gate_resident_lines):
+            self.cache.bypass_write(address, data)
+            self.gated_nc_write_lines += 1
+            placement = "nc_write"
+        else:
+            self.cache.io_write(address, data, self.admission)
+            if self.policy.adaptive_ncp_gate:
+                self.gated_ncp_lines += 1
+                placement = "ncp"
         state.visible_ns[offset] = now
         state.admitted[offset] = self.cache.resident(address)
         state.pending_payload_lines -= 1
         self._record(now, "payload_visible", flow=state.packet.flow,
                      serial=state.packet.serial, offset=offset,
-                     admitted=state.admitted[offset])
+                     admitted=state.admitted[offset], placement=placement,
+                     resident_lines=self.cache.resident_lines())
         if self.policy.family == "ncp" and self.config.ncp_withdraw_ns is not None:
             self._schedule(now + self.config.ncp_withdraw_ns, "withdraw", state.index, offset, data)
         if state.pending_payload_lines == 0:
@@ -572,6 +594,8 @@ class Simulation:
         self._try_cpu(now)
 
     def run(self):
+        if self.policy.adaptive_ncp_gate and self.config.ncp_withdraw_ns is not None:
+            raise TimingError("adaptive gating and post-push withdrawal are separate policies")
         total = len(self.states)
         while len(self.delivered) < total:
             if not self.events:
@@ -621,6 +645,16 @@ class Simulation:
             raise TimingError("payload first-demand denominator is not one per cache line")
         if self.payload_push_bytes != expected_push or self.producer_link_bytes != expected_producer:
             raise TimingError("producer link-byte conservation failed")
+        gated_lines = self.gated_ncp_lines + self.gated_nc_write_lines
+        if self.policy.adaptive_ncp_gate and gated_lines != expected_lines:
+            raise TimingError("adaptive gate did not classify every payload line")
+        if not self.policy.adaptive_ncp_gate and gated_lines:
+            raise TimingError("non-gated policy recorded adaptive gate decisions")
+        if self.policy.adaptive_ncp_gate:
+            bypass = cache_before_flush["stats"]["bypass"]
+            if (bypass["lines"] != self.gated_nc_write_lines
+                    or bypass["bytes"] != self.gated_nc_write_lines * LINE_BYTES):
+                raise TimingError("adaptive NC-write bypass accounting is inconsistent")
         if self.link_bytes != self.producer_link_bytes + self.cpu_nic_read_bytes:
             raise TimingError("modeled link-byte classes do not sum to the total")
         if self.policy.use_credit and any(
@@ -661,6 +695,12 @@ class Simulation:
             "producer_link_bytes": self.producer_link_bytes,
             "cpu_nic_read_bytes": self.cpu_nic_read_bytes,
             "payload_push_bytes": self.payload_push_bytes,
+            "adaptive_gate": {"threshold_resident_lines": (
+                                  self.config.ncp_gate_resident_lines
+                                  if self.policy.adaptive_ncp_gate else None),
+                              "ncp_lines": self.gated_ncp_lines,
+                              "nc_write_lines": self.gated_nc_write_lines,
+                              "nc_write_bytes": self.gated_nc_write_lines * LINE_BYTES},
             "link_busy_until_ns": self.link_available_ns,
             "nic_buffer_peak_bytes": self.nic_buffer_peak,
             "cpu_reorder_buffer_peak_bytes": self.cpu_reorder_buffer_peak,
@@ -688,6 +728,7 @@ def _comparable(result):
         "delivery_latency_ns", "sequence_wait_ns", "push_to_first_demand_ns",
         "payload_first_demand", "admitted_absent_at_first_demand", "link_bytes",
         "producer_link_bytes", "cpu_nic_read_bytes", "payload_push_bytes",
+        "adaptive_gate",
         "link_busy_until_ns", "nic_buffer_peak_bytes",
         "cpu_reorder_buffer_peak_bytes",
         "credit_peak_bytes", "credit_stall_events", "credit_stall_ns",
@@ -765,9 +806,10 @@ def main(argv=None):
     parser.add_argument("--background-interval-ns", type=int)
     parser.add_argument("--background-working-set-lines", type=int, default=0)
     parser.add_argument("--ncp-withdraw-ns", type=int)
+    parser.add_argument("--ncp-gate-resident-lines", type=int, default=32)
     parser.add_argument("--max-time-ns", type=int, default=10_000_000)
     parser.add_argument("--policies", default=",".join(POLICIES),
-                        help="comma-separated A,B0,B1,C,D0,D1,E,D1-host-control")
+                        help="comma-separated A,B0,B1,C,D0,D1,D1-gated,E,D1-host-control")
     args = parser.parse_args(argv)
     packets = generate_workload(flows=args.flows, packets_per_flow=args.packets_per_flow,
                                 interarrival_ns=args.interarrival_ns,
@@ -787,6 +829,7 @@ def main(argv=None):
                           background_interval_ns=args.background_interval_ns,
                           background_working_set_lines=args.background_working_set_lines,
                           ncp_withdraw_ns=args.ncp_withdraw_ns,
+                          ncp_gate_resident_lines=args.ncp_gate_resident_lines,
                           max_time_ns=args.max_time_ns)
     args.output.mkdir(parents=True, exist_ok=False)
     workload = [{"flow": packet.flow, "serial": packet.serial,
