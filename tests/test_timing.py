@@ -145,6 +145,21 @@ class TimingPolicyTests(unittest.TestCase):
         self.assertEqual(baseline["payload_first_demand"]["hits"], 1)
         self.assertEqual(withdrawn["payload_first_demand"]["misses"], 1)
         self.assertEqual(withdrawn["withdrawn_payload_lines"], 1)
+        self.assertEqual(withdrawn["withdrawal_timing"],
+                         {"scheduled_lines": 1, "before_first_demand_lines": 1,
+                          "after_first_demand_lines": 0,
+                          "stale_after_release_lines": 0,
+                          "pending_after_completion_lines": 0})
+
+    def test_late_withdrawals_remain_stale_or_pending_after_release(self):
+        result = Simulation((packet(0, 0),), "D1",
+                            config(ncp_withdraw_ns=10_000)).run()
+        timing = result["withdrawal_timing"]
+        self.assertEqual(timing["scheduled_lines"], 1)
+        self.assertEqual(timing["before_first_demand_lines"], 0)
+        self.assertEqual(timing["after_first_demand_lines"], 0)
+        self.assertEqual(timing["stale_after_release_lines"]
+                         + timing["pending_after_completion_lines"], 1)
 
     def test_background_and_backing_traffic_have_explicit_denominators(self):
         result = Simulation(
@@ -190,7 +205,7 @@ class TimingPolicyTests(unittest.TestCase):
                     "push_to_first_demand_ns", "payload_first_demand", "link_bytes",
                     "producer_link_bytes", "cpu_nic_read_bytes", "payload_push_bytes",
                     "background_demand", "backing_traffic_bytes", "credit_stall_ns",
-                    "packet_records", "cache_before_final_flush"):
+                    "withdrawal_timing", "packet_records", "cache_before_final_flush"):
             with self.subTest(key=key):
                 self.assertEqual(all_ncp[key], baseline[key])
 

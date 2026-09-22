@@ -319,6 +319,10 @@ class Simulation:
         self.first_misses = 0
         self.admitted_absent = 0
         self.withdrawals = 0
+        self.withdrawals_scheduled = 0
+        self.withdrawals_before_demand = 0
+        self.withdrawals_after_demand = 0
+        self.withdrawals_stale = 0
         self.gated_ncp_lines = 0
         self.gated_nc_write_lines = 0
         self.delivered = []
@@ -480,6 +484,7 @@ class Simulation:
                      resident_lines=self.cache.resident_lines())
         if self.policy.family == "ncp" and self.config.ncp_withdraw_ns is not None:
             self._schedule(now + self.config.ncp_withdraw_ns, "withdraw", state.index, offset, data)
+            self.withdrawals_scheduled += 1
         if state.pending_payload_lines == 0:
             state.data_complete = True
             self._try_publish(state.packet.flow, now, state)
@@ -505,13 +510,19 @@ class Simulation:
 
     def _withdraw(self, now, state, offset, data):
         if state.released:
+            self.withdrawals_stale += 1
             self._record(now, "withdraw_stale", flow=state.packet.flow,
                          serial=state.packet.serial, offset=offset)
             return
         self.cache.bypass_write(state.base + PAYLOAD_OFFSET + offset, data)
         self.withdrawals += 1
+        if state.consume_ns is None:
+            self.withdrawals_before_demand += 1
+        else:
+            self.withdrawals_after_demand += 1
         self._record(now, "withdraw", flow=state.packet.flow,
-                     serial=state.packet.serial, offset=offset)
+                     serial=state.packet.serial, offset=offset,
+                     before_first_demand=state.consume_ns is None)
 
     def _background(self, now):
         address = BACKGROUND_BASE + (self.background_index % self.config.background_working_set_lines) * LINE_BYTES
@@ -676,6 +687,13 @@ class Simulation:
                     or bypass["bytes"] != self.gated_nc_write_lines * LINE_BYTES):
                 raise TimingError("adaptive NC-write bypass accounting is inconsistent")
         traffic = cache_before_flush["stats"]
+        pending_withdrawals = sum(kind == "withdraw" for _, _, kind, _ in self.events)
+        if self.withdrawals != self.withdrawals_before_demand + self.withdrawals_after_demand:
+            raise TimingError("executed withdrawal classes are inconsistent")
+        if (self.withdrawals_before_demand + self.withdrawals_after_demand
+                + self.withdrawals_stale + pending_withdrawals
+                != self.withdrawals_scheduled):
+            raise TimingError("post-push withdrawal accounting is inconsistent")
         if self.link_bytes != self.producer_link_bytes + self.cpu_nic_read_bytes:
             raise TimingError("modeled link-byte classes do not sum to the total")
         if self.policy.use_credit and any(
@@ -735,6 +753,11 @@ class Simulation:
             "credit_stall_events": {str(flow): value for flow, value in self.credit_stall_events.items()},
             "credit_stall_ns": {str(flow): value for flow, value in self.credit_stall_ns.items()},
             "withdrawn_payload_lines": self.withdrawals,
+            "withdrawal_timing": {"scheduled_lines": self.withdrawals_scheduled,
+                                  "before_first_demand_lines": self.withdrawals_before_demand,
+                                  "after_first_demand_lines": self.withdrawals_after_demand,
+                                  "stale_after_release_lines": self.withdrawals_stale,
+                                  "pending_after_completion_lines": pending_withdrawals},
             "delivery_order": [{"flow": flow, "serial": serial, "time_ns": time_ns}
                                for flow, serial, time_ns in self.delivered],
             "packet_records": [{"flow": state.packet.flow, "serial": state.packet.serial,
@@ -760,7 +783,7 @@ def _comparable(result):
         "link_busy_until_ns", "nic_buffer_peak_bytes",
         "cpu_reorder_buffer_peak_bytes",
         "credit_peak_bytes", "credit_stall_events", "credit_stall_ns",
-        "withdrawn_payload_lines", "delivery_order", "packet_records",
+        "withdrawn_payload_lines", "withdrawal_timing", "delivery_order", "packet_records",
         "cache_before_final_flush", "cache_after_final_flush")}
 
 

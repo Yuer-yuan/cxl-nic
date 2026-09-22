@@ -36,9 +36,12 @@ python3 -m cxl_nic.timing "${common[@]}" --gap-delay-ns 800 \
 python3 -m cxl_nic.timing "${common[@]}" --gap-delay-ns 800 \
     --ddio-ways 0,1 --ncp-ways all --policies "$core_policies" \
     --output "$run_dir/admission" > "$run_dir/admission.stdout.json"
-python3 -m cxl_nic.timing "${common[@]}" --gap-delay-ns 800 \
-    --ncp-withdraw-ns 200 --policies C,D1,E \
-    --output "$run_dir/withdraw" > "$run_dir/withdraw.stdout.json"
+for withdraw_ns in 0 400 800 1600 3200; do
+    printf -v withdraw_name 'withdraw-%04d' "$withdraw_ns"
+    python3 -m cxl_nic.timing "${common[@]}" --gap-delay-ns 800 \
+        --ncp-withdraw-ns "$withdraw_ns" --policies D1,E \
+        --output "$run_dir/$withdraw_name" > "$run_dir/$withdraw_name.stdout.json"
+done
 python3 -m cxl_nic.timing "${common[@]}" --gap-delay-ns 800 \
     --push-credit-bytes-per-flow 1536 --policies B1,D1,D1-host-control \
     --output "$run_dir/credit-1536" > "$run_dir/credit-1536.stdout.json"
@@ -66,7 +69,9 @@ import sys
 
 run = Path(sys.argv[1])
 names = ('matrix', 'gap-0000', 'gap-0200', 'gap-0800', 'gap-2400',
-         'pressure', 'admission', 'withdraw', 'credit-1536', 'stride-128',
+         'pressure', 'admission', 'withdraw-0000', 'withdraw-0400',
+         'withdraw-0800', 'withdraw-1600', 'withdraw-3200',
+         'credit-1536', 'stride-128',
          'stride-129', 'gate-0000', 'gate-0032', 'gate-0513')
 results = {name: json.loads((run / name / 'result.json').read_text()) for name in names}
 for name, result in results.items():
@@ -92,6 +97,21 @@ for result in results.values():
             raise SystemExit('first-demand denominator is inconsistent')
         if arm['link_bytes'] != arm['producer_link_bytes'] + arm['cpu_nic_read_bytes']:
             raise SystemExit('modeled link traffic is inconsistent')
+
+withdrawals = [results[name]['arms']['D1'] for name in
+               ('withdraw-0000', 'withdraw-0400', 'withdraw-0800',
+                'withdraw-1600', 'withdraw-3200')]
+withdraw_hits = [arm['payload_first_demand']['hits'] for arm in withdrawals]
+withdraw_before = [arm['withdrawal_timing']['before_first_demand_lines']
+                   for arm in withdrawals]
+if withdraw_hits != sorted(withdraw_hits):
+    raise SystemExit('longer withdrawal windows did not monotonically retain payload hits')
+if withdraw_before != sorted(withdraw_before, reverse=True):
+    raise SystemExit('longer withdrawal windows increased pre-demand withdrawals')
+if (withdraw_hits[0] != 0
+        or withdraw_hits[-1] != results['gap-0800']['arms']['D1']['payload_first_demand']['hits']
+        or withdraw_before[-1] != 0):
+    raise SystemExit('post-push withdrawal endpoints differ from NC-write/all-NC-P behavior')
 
 gate_zero = results['gate-0000']['arms']['D1-gated']
 gate_mixed = results['gate-0032']['arms']['D1-gated']
@@ -126,13 +146,15 @@ def short(arm):
             'cpu_reorder_buffer_peak_bytes': arm['cpu_reorder_buffer_peak_bytes'],
             'credit_stall_ns': sum(arm['credit_stall_ns'].values()),
             'adaptive_gate': arm['adaptive_gate'],
+            'withdrawal_timing': arm['withdrawal_timing'],
             'backing_traffic_bytes': arm['backing_traffic_bytes']}
 
 summary = {
     'status': 'passed',
     'scope': 'uncalibrated integer virtual time; reliable finite reordering only',
     'checks': {'gate_endpoints': 'passed', 'gate_mixed_choice': 'passed',
-               'gate_d1_label_invariance': 'passed'},
+               'gate_d1_label_invariance': 'passed',
+               'withdrawal_window_monotonicity': 'passed'},
     'cases': {name: {policy: short(arm) for policy, arm in result['arms'].items()}
               for name, result in results.items()},
     'result_sha256': {name: hashlib.sha256((run / name / 'result.json').read_bytes()).hexdigest()

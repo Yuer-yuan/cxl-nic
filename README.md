@@ -242,8 +242,8 @@ NIC-home CPU miss consumes return-link bandwidth and waits behind queued produce
 traffic. Host and NIC backing service times are separate parameters.
 
 The verification script runs the full matrix plus gap-delay, LLC pressure, I/O way
-admission, NC-write withdrawal, tight-credit, packet-stride and adaptive-gate
-threshold cases. Gate thresholds cover all NC-write, mixed placement and all NC-P;
+admission, an NC-write withdrawal-window sweep, tight-credit, packet-stride and
+adaptive-gate threshold cases. Gate thresholds cover all NC-write, mixed placement and all NC-P;
 the all-NC-P endpoint must be identical to D1. Packet stride
 is expressed in cache lines; 128 and 129 line strides expose sensitivity to the
 model's simple modulo set mapping. It records ordered-delivery p50/p99 latency,
