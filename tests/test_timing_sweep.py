@@ -5,7 +5,7 @@ import unittest
 
 from cxl_nic.timing import TimingConfig, generate_workload, run_matrix
 from cxl_nic.timing_sweep import (CASES, POLICY_NAMES, SweepCase,
-                                  _validate_result, validate_cases)
+                                  PAPER_ANCHORS, _validate_result, validate_cases)
 
 
 class TimingSweepTests(unittest.TestCase):
@@ -15,9 +15,12 @@ class TimingSweepTests(unittest.TestCase):
         self.assertTrue(all(case.flows * case.packets_per_flow == 64 for case in cases))
         self.assertEqual({case.axis for case in cases},
                          {"gate_threshold_lines", "llc_capacity_lines", "cpu_base_ns",
-                          "packet_size_bytes", "flows"})
+                          "packet_size_bytes", "flows", "link_bandwidth_gbps",
+                          "link_latency_ns", "nic_miss_ns"})
         thresholds = [case.value for case in cases if case.axis == "gate_threshold_lines"]
         self.assertEqual(thresholds, [0, 128, 256, 384, 513])
+        self.assertEqual(PAPER_ANCHORS["derived_approx_ncp_nc_write_gbps"], 184)
+        self.assertFalse(PAPER_ANCHORS["adaptive_gate_threshold_reported"])
 
     def test_case_validation_rejects_changed_work_or_mislabeled_capacity(self):
         with self.assertRaisesRegex(ValueError, "64 total packets"):

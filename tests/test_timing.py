@@ -219,6 +219,17 @@ class TimingPolicyTests(unittest.TestCase):
         self.assertEqual(demand["cpu_nic_read_bytes"], 64)
         self.assertEqual(demand["link_bytes"], 192)
 
+    def test_fractional_line_serialization_distinguishes_paper_bandwidth_anchors(self):
+        workload = tuple(packet(serial, 0, 1500) for serial in range(4))
+        measured = Simulation(
+            workload, "D1", config(link_bandwidth_gbps=184,
+                                   push_credit_bytes_per_flow=6000)).run()
+        theoretical = Simulation(
+            workload, "D1", config(link_bandwidth_gbps=204,
+                                   push_credit_bytes_per_flow=6000)).run()
+        self.assertGreater(measured["link_busy_until_ns"], theoretical["link_busy_until_ns"])
+        self.assertEqual(measured["link_bytes"], theoretical["link_bytes"])
+
     def test_buffer_capacity_is_a_hard_failure_not_silent_packet_loss(self):
         with self.assertRaisesRegex(TimingError, "buffer capacity"):
             Simulation((packet(0, 0, 65),), "D1", config(nic_buffer_bytes=64)).run()

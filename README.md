@@ -196,7 +196,13 @@ bash scripts/verify_timing_sweep.sh results/timing-sweep-001
 
 The sweep holds 64 packets per case and varies one experimental axis: NC-P gate
 threshold, normalized LLC capacity, CPU base service, fixed packet size, or flow
-count. Every case runs B1, D1, D1-gated and D1-host-control on the same workload.
+count. It also sweeps link bandwidth at 100 Gbps, the paper-derived 184 Gbps
+NC-P/NC-write point, and its 204 Gbps theoretical limit; unreported link and NIC
+miss latencies remain explicit sensitivity axes. Every case runs B1, D1, D1-gated
+and D1-host-control on the same workload.
+The paper reports the 400 MHz, one-64-byte-request-per-cycle throughput anchor and
+roughly 90% utilization for NC-P/NC-write, but does not report its adaptive LLC
+threshold or post-push delay `N`; neither value is treated as calibrated here.
 It reports payload and background hit rates, background misses per virtual
 microsecond, backing and link traffic, buffer/credit pressure and p50/p99 ordered
 delivery latency. These are sensitivity results rather than hardware predictions.

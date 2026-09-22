@@ -27,6 +27,7 @@ READY_OFFSET = 64
 RELEASE_OFFSET = 128
 PAYLOAD_OFFSET = 256
 BACKGROUND_BASE = 1 << 52
+PS_PER_NS = 1000
 
 
 class TimingError(ValueError):
@@ -35,6 +36,10 @@ class TimingError(ValueError):
 
 def aligned_size(size):
     return (size + LINE_BYTES - 1) // LINE_BYTES * LINE_BYTES
+
+
+def _ns_ceil(picoseconds):
+    return (picoseconds + PS_PER_NS - 1) // PS_PER_NS
 
 
 @dataclass(frozen=True)
@@ -290,7 +295,7 @@ class Simulation:
         self.events = []
         self._event_id = 0
         self.log = []
-        self.link_available_ns = 0
+        self.link_available_ps = 0
         self.link_bytes = 0
         self.producer_link_bytes = 0
         self.cpu_nic_read_bytes = 0
@@ -331,14 +336,17 @@ class Simulation:
         self.log.append({"time_ns": time_ns, "event": event, **fields})
 
     def _link_line(self, now, kind, *arguments):
-        start = max(now, self.link_available_ns)
-        serialization = math.ceil(LINE_BYTES * 8 / self.config.link_bandwidth_gbps)
-        self.link_available_ns = start + serialization
-        complete = self.link_available_ns + self.config.link_latency_ns
+        start = max(now * PS_PER_NS, self.link_available_ps)
+        bits_ps = LINE_BYTES * 8 * PS_PER_NS
+        serialization = ((bits_ps + self.config.link_bandwidth_gbps - 1)
+                         // self.config.link_bandwidth_gbps)
+        self.link_available_ps = start + serialization
+        complete = _ns_ceil(
+            self.link_available_ps + self.config.link_latency_ns * PS_PER_NS)
         self.link_bytes += LINE_BYTES
         self.producer_link_bytes += LINE_BYTES
         self._schedule(complete, kind, *arguments)
-        return start, complete
+        return _ns_ceil(start), complete
 
     def _cpu_access_complete(self, cursor, hit):
         if hit:
@@ -348,12 +356,15 @@ class Simulation:
         # A NIC-home miss is a demand fetch over the same modeled link.  The
         # configured miss value is device-memory/backing service after the
         # serialized request; it is not a measured hardware latency.
-        start = max(cursor, self.link_available_ns)
-        serialization = math.ceil(LINE_BYTES * 8 / self.config.link_bandwidth_gbps)
-        self.link_available_ns = start + serialization
+        start = max(cursor * PS_PER_NS, self.link_available_ps)
+        bits_ps = LINE_BYTES * 8 * PS_PER_NS
+        serialization = ((bits_ps + self.config.link_bandwidth_gbps - 1)
+                         // self.config.link_bandwidth_gbps)
+        self.link_available_ps = start + serialization
         self.link_bytes += LINE_BYTES
         self.cpu_nic_read_bytes += LINE_BYTES
-        return self.link_available_ns + self.config.link_latency_ns + self.config.nic_miss_ns
+        return (_ns_ceil(self.link_available_ps + self.config.link_latency_ns * PS_PER_NS)
+                + self.config.nic_miss_ns)
 
     def _descriptor(self, state):
         packet = state.packet
@@ -717,7 +728,7 @@ class Simulation:
                               "ncp_lines": self.gated_ncp_lines,
                               "nc_write_lines": self.gated_nc_write_lines,
                               "nc_write_bytes": self.gated_nc_write_lines * LINE_BYTES},
-            "link_busy_until_ns": self.link_available_ns,
+            "link_busy_until_ns": _ns_ceil(self.link_available_ps),
             "nic_buffer_peak_bytes": self.nic_buffer_peak,
             "cpu_reorder_buffer_peak_bytes": self.cpu_reorder_buffer_peak,
             "credit_peak_bytes": {str(flow): value for flow, value in self.credit_peak.items()},

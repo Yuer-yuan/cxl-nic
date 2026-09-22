@@ -12,6 +12,18 @@ from .timing import TimingConfig, generate_workload, run_matrix
 
 
 POLICY_NAMES = ("B1", "D1", "D1-gated", "D1-host-control")
+PAPER_ANCHORS = {
+    "source": "https://doi.org/10.1145/3725843.3756102",
+    "fpga_clock_mhz": 400,
+    "cache_line_bytes": 64,
+    "theoretical_rx_gbps": 204,
+    "ncp_nc_write_approx_fraction_of_limit": 0.90,
+    "derived_approx_ncp_nc_write_gbps": 184,
+    "host_llc_mib": 60,
+    "host_cpu_ghz": 2.2,
+    "adaptive_gate_threshold_reported": False,
+    "post_push_delay_cycles_reported": False,
+}
 BASE_CONFIG = TimingConfig(background_interval_ns=20,
                            background_working_set_lines=128,
                            ncp_gate_resident_lines=384)
@@ -68,6 +80,21 @@ CASES = (
     SweepCase("flows-02", "flows", 2),
     SweepCase("flows-04", "flows", 4, flows=4, packets_per_flow=16),
     SweepCase("flows-08", "flows", 8, flows=8, packets_per_flow=8),
+    SweepCase("bandwidth-100", "link_bandwidth_gbps", 100),
+    SweepCase("bandwidth-184", "link_bandwidth_gbps", 184,
+              config_changes=(("link_bandwidth_gbps", 184),)),
+    SweepCase("bandwidth-204", "link_bandwidth_gbps", 204,
+              config_changes=(("link_bandwidth_gbps", 204),)),
+    SweepCase("link-latency-050", "link_latency_ns", 50,
+              config_changes=(("link_latency_ns", 50),)),
+    SweepCase("link-latency-100", "link_latency_ns", 100),
+    SweepCase("link-latency-200", "link_latency_ns", 200,
+              config_changes=(("link_latency_ns", 200),)),
+    SweepCase("nic-miss-100", "nic_miss_ns", 100,
+              config_changes=(("nic_miss_ns", 100),)),
+    SweepCase("nic-miss-250", "nic_miss_ns", 250),
+    SweepCase("nic-miss-500", "nic_miss_ns", 500,
+              config_changes=(("nic_miss_ns", 500),)),
 )
 
 
@@ -87,6 +114,9 @@ def validate_cases(cases=CASES):
                 raise ValueError(f"{case.name}: capacity sweep must retain 1/4 background and 3/4 gate")
         if case.axis == "gate_threshold_lines" and config.ncp_gate_resident_lines != case.value:
             raise ValueError(f"{case.name}: gate threshold does not match its axis value")
+        if case.axis in ("link_bandwidth_gbps", "link_latency_ns", "nic_miss_ns"):
+            if getattr(config, case.axis) != case.value:
+                raise ValueError(f"{case.name}: timing parameter does not match its axis value")
     return tuple(cases)
 
 
@@ -189,6 +219,13 @@ def run_sweep(output, cases=CASES):
         "scope": ("controlled uncalibrated virtual-time sensitivities; reliable finite "
                   "reordering; 64 packets per case"),
         "policies": list(POLICY_NAMES),
+        "paper_anchors": PAPER_ANCHORS,
+        "unresolved_calibration": [
+            "CXL one-way request latency",
+            "host-memory and NIC-memory miss service",
+            "adaptive gate threshold",
+            "post-push delay cycles",
+            "physical LLC indexing and replacement"],
         "checks": {"matched_label_control": "passed",
                    "ordered_delivery_and_conservation": "passed",
                    "adaptive_gate_accounting": "passed",
