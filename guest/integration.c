@@ -4,6 +4,8 @@
 #include <stdint.h>
 
 #define CXL_BASE UINT64_C(0x1000000000)
+#define TYPE2_BAR4_BASE UINT64_C(0x400000000)
+#define TYPE2_DPA_BASE UINT64_C(0x200000)
 #define RP_CONFIG UINT64_C(0x34000000)
 #define DEVICE_CONFIG UINT64_C(0x34100000)
 #define COMPONENT_BAR UINT64_C(0x70000000)
@@ -18,6 +20,7 @@
 
 static uint8_t payload[MAX_PAYLOAD];
 static int cxl_configured;
+static uint64_t data_base = CXL_BASE;
 
 static void fence_io(void)
 {
@@ -101,7 +104,7 @@ __attribute__((noreturn)) static void fail(uint64_t code, uint64_t flow,
     uart_char('\n');
     if (cxl_configured) {
         fence_io();
-        store64(CXL_BASE + 64, UINT64_C(0x100) + code);
+        store64(data_base + 64, UINT64_C(0x100) + code);
         fence_io();
     }
     park();
@@ -123,22 +126,41 @@ __attribute__((noreturn)) void guest_trap(uint64_t cause, uint64_t pc,
 static void configure_cxl(void)
 {
     uint32_t id = load32(RP_CONFIG);
+    int type2;
     if ((id & UINT32_C(0xffff)) == UINT32_C(0xffff) || !(id & 0xffff)) {
         fail(3, 0, 0, RP_CONFIG);
     }
     store32(RP_CONFIG + 0x18, UINT32_C(0x00414140));
     /* CXL MMIO32 is 0x70000000..0x7fffffff on this machine. */
     store32(RP_CONFIG + 0x20, UINT32_C(0x70007000));
+    /* Type2 BAR4 uses 0x400000000..0x40fffffff; BAR2 follows it. */
+    store32(RP_CONFIG + 0x24, UINT32_C(0x10010001));
+    store32(RP_CONFIG + 0x28, 4);
+    store32(RP_CONFIG + 0x2c, 4);
     store16(RP_CONFIG + 0x04, 6);
     fence_io();
     id = load32(DEVICE_CONFIG);
     if ((id & UINT32_C(0xffff)) == UINT32_C(0xffff) || !(id & 0xffff)) {
         fail(3, 0, 0, DEVICE_CONFIG);
     }
+    type2 = (id & UINT32_C(0xffff)) == UINT32_C(0x8086) &&
+            (id >> 16) == UINT32_C(0x0d92);
     store32(DEVICE_CONFIG + 0x10, UINT32_C(0x70000004));
     store32(DEVICE_CONFIG + 0x14, 0);
+    if (type2) {
+        store32(DEVICE_CONFIG + 0x18, UINT32_C(0x1000000c));
+        store32(DEVICE_CONFIG + 0x1c, 4);
+        store32(DEVICE_CONFIG + 0x20, UINT32_C(0x0000000c));
+        store32(DEVICE_CONFIG + 0x24, 4);
+    }
     store16(DEVICE_CONFIG + 0x04, 6);
     fence_io();
+
+    if (type2) {
+        data_base = TYPE2_BAR4_BASE + TYPE2_DPA_BASE;
+        cxl_configured = 1;
+        return;
+    }
 
     /* Pinned QEMU's CXL HDM capability starts at cache/mem offset 0x128.
      * One root port uses host bridge passthrough, so only the endpoint HDM
@@ -217,7 +239,7 @@ void guest_main(void)
 
     configure_cxl();
     for (unsigned index = 0; index < 8; ++index) {
-        control[index] = load64(CXL_BASE + index * 8);
+        control[index] = load64(data_base + index * 8);
     }
     fence_io();
     if (control[0] != MAGIC || control[2] == 0 ||
@@ -230,7 +252,7 @@ void guest_main(void)
     expected[0] = control[3];
     expected[1] = control[4];
     fence_io();
-    store64(CXL_BASE + 64, 1);
+    store64(data_base + 64, 1);
     fence_io();
     uart_text("READY\n");
 
@@ -243,7 +265,7 @@ void guest_main(void)
             serial = expected[flow];
             slot = serial % WINDOW;
             generation = consumed[flow] / WINDOW + 1;
-            address = CXL_BASE + SLOT_BASE + (flow * WINDOW + slot) * SLOT_STRIDE;
+            address = data_base + SLOT_BASE + (flow * WINDOW + slot) * SLOT_STRIDE;
             if (load64(address + 64) != generation) {
                 continue;
             }
@@ -280,7 +302,7 @@ void guest_main(void)
     uart_field(total);
     uart_char('\n');
     fence_io();
-    store64(CXL_BASE + 64, 2);
+    store64(data_base + 64, 2);
     fence_io();
     park();
 }

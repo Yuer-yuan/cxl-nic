@@ -55,6 +55,11 @@ bash scripts/build_guest.sh
 python3 -m cxl_nic.integration --output results/integration-run-001
 ```
 
+Use `--device-type type2` to run the same functional publication suite through
+the pinned QEMU Type2 device. The default remains `type3`. Both modes use the
+legacy authoritative TCP memory path; Type2 selection alone does not exercise
+NC-P or prove host LLC placement.
+
 Omit `--install-deps` when the build dependencies are already installed. Use
 `JOBS=8` to set build parallelism. No guest Linux image is required.
 
@@ -208,11 +213,12 @@ ignored, while a second physical write must be represented as a separate operati
 These checks exercise the shared functional contract intended for both PCIe NIC
 reordering plus delayed DMA/DDIO and CXL NIC reordering plus delayed NC-P. They do
 not implement either NIC transport or measure their performance. The guest path
-uses the existing Type3 legacy TCP backend, whose responses provide authoritative
-data for guest reads. It validates publication, data delivery and ownership with
-actual guest loads/stores, but does not establish CXL.cache/NC-P semantics, physical
-CPU memory ordering or hardware LLC residency/hit rate. The separate cache replay
-explores explicit cache assumptions. Guest fences are exercised under QEMU TCG;
+supports the pinned Type2 and Type3 legacy TCP endpoints, whose backend responses
+provide authoritative data for guest reads. It validates publication, data delivery
+and ownership with actual guest loads/stores, but does not establish CXL.cache/NC-P
+semantics, physical CPU memory ordering or hardware LLC residency/hit rate. The
+separate cache replay explores explicit cache assumptions. Guest fences are
+exercised under QEMU TCG;
 weak-memory behavior still needs separate validation.
 
 Bounded and seeded schedules are evidence for the tested cases, not a formal proof

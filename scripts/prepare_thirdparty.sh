@@ -48,5 +48,5 @@ prepare() {
     printf '%s %s\n' "$name" "$revision"
 }
 
-prepare qemu 9e75918b07d6f90a063484f8a1acbed3bb56078b git@github.com:Yuer-yuan/qemu-cxl-type2.git
+prepare qemu 8776c8379a20033d913c55099fc87cabdf9d9e30 git@github.com:Yuer-yuan/qemu-cxl-type2.git
 prepare cxlmemsim 3ade2316bc09a30e4050be56e2919310b2baa3c8 git@github.com:Yuer-yuan/CXLMemSim.git

@@ -1,4 +1,4 @@
-"""RISC-V guest validation over the pinned CXLMemSim legacy TCP backend.
+"""RISC-V guest validation over a pinned CXLMemSim Type2 or Type3 endpoint.
 
 This exercises publication and ownership using real guest loads/stores, without
 claiming a physical CXL.cache, NC-P, LLC, or weak-memory implementation.
@@ -34,9 +34,10 @@ SLOT_STRIDE = 0x1000
 PAYLOAD_OFFSET = 256
 READY_OFFSET = 64
 RELEASE_OFFSET = 128
+TYPE2_DPA_BASE = 0x200000
 INITIAL = {0: 254, 1: 510}
 FIELDS = ("flow", "serial", "slot", "generation", "length")
-PINS = {"qemu": "9e75918b07d6f90a063484f8a1acbed3bb56078b",
+PINS = {"qemu": "8776c8379a20033d913c55099fc87cabdf9d9e30",
         "cxlmemsim": "3ade2316bc09a30e4050be56e2919310b2baa3c8"}
 
 
@@ -63,6 +64,12 @@ def write_address(write):
     if write.kind == "descriptor":
         return base + FIELDS.index(write.field) * 8, struct.pack("<Q", write.value)
     return base + READY_OFFSET, struct.pack("<Q", write.token.generation)
+
+
+def backend_address(address, device_type):
+    if device_type not in ("type2", "type3"):
+        raise ValueError("device_type must be type2 or type3")
+    return address + (TYPE2_DPA_BASE if device_type == "type2" else 0)
 
 
 class GuestOutput:
@@ -111,32 +118,46 @@ def available_port():
         return sock.getsockname()[1]
 
 
-def qemu_command(binary, guest):
-    return [str(binary), "-M", "sifive_u", "-machine",
-            "cxl=on,cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=256M",
-            "-smp", "2", "-m", "256M", "-bios", "none", "-kernel", str(guest),
-            "-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot",
-            "-object", "memory-backend-ram,id=t3mem,size=256M",
-            "-device", "pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl.1",
-            "-device", "cxl-rp,bus=cxl.1,port=0,id=rp-t3,chassis=0,slot=0",
-            "-device", "cxl-type3,bus=rp-t3,volatile-memdev=t3mem,id=t3"]
+def qemu_command(binary, guest, device_type="type3", port=None):
+    command = [str(binary), "-M", "sifive_u", "-machine",
+               "cxl=on,cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=256M",
+               "-smp", "2", "-m", "256M", "-bios", "none", "-kernel", str(guest),
+               "-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot"]
+    if device_type == "type3":
+        return command + ["-object", "memory-backend-ram,id=t3mem,size=256M",
+                          "-device", "pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl.1",
+                          "-device", "cxl-rp,bus=cxl.1,port=0,id=rp-t3,chassis=0,slot=0",
+                          "-device", "cxl-type3,bus=rp-t3,volatile-memdev=t3mem,id=t3"]
+    if device_type != "type2":
+        raise ValueError("device_type must be type2 or type3")
+    if type(port) is not int or not 0 < port <= 65535:
+        raise ValueError("a valid CXLMemSim port is required for Type2")
+    return command + ["-device", "pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl.1",
+                      "-device", "cxl-rp,bus=cxl.1,port=0,id=rp-t2,chassis=0,slot=0",
+                      "-device", ("cxl-type2,bus=rp-t2,id=t2,sn=200,gpu-mode=0,"
+                                  "cache-size=1M,mem-size=256M,"
+                                  "cxlmemsim-addr=127.0.0.1,"
+                                  f"cxlmemsim-port={port},coherency-enabled=true")]
 
 
-def run_case(directory, qemu, server, guest, topology, mode, count, timeout):
+def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
+             device_type="type3"):
     directory.mkdir()
     port = available_port()
     nonce = secrets.randbits(64)
     server_argv = [str(server), "--comm-mode=tcp", f"--port={port}", "--capacity=256",
                    "--backing-mode=file", f"--backing-file={directory / 'backing.raw'}",
                    f"--topology={topology}"]
-    qemu_argv = qemu_command(qemu, guest)
+    qemu_argv = qemu_command(qemu, guest, device_type, port)
     server_environment = {**os.environ, "CXL_BASE_ADDR": "0"}
     qemu_environment = {**os.environ, "CXL_TRANSPORT_MODE": "tcp",
                         "CXL_MEMSIM_HOST": "127.0.0.1", "CXL_MEMSIM_PORT": str(port),
                         "CXL_LATENCY_INJECT": "0"}
     result = {"mode": mode, "status": "running", "nonce": nonce,
               "qemu_argv": qemu_argv, "server_argv": server_argv,
-              "packets_per_flow": count, "backend": "legacy TCP authoritative Type3 memory",
+              "packets_per_flow": count, "device_type": device_type,
+              "backend_dpa_base": backend_address(0, device_type),
+              "backend": f"legacy TCP authoritative {device_type.capitalize()} memory",
               "fault_injected": False}
     protocol = Protocol(Config(), INITIAL)
     server_process = guest_process = client = output = None
@@ -155,13 +176,13 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout):
             except OSError:
                 time.sleep(0.05)
         control = struct.pack("<8Q", MAGIC, nonce, count, INITIAL[0], INITIAL[1], 2, 4, 1500)
-        client.write(0, control)
-        client.write(64, bytes(64))
+        client.write(backend_address(0, device_type), control)
+        client.write(backend_address(64, device_type), bytes(64))
         for index in range(8):
             base = SLOT_BASE + index * SLOT_STRIDE
-            client.write(base, bytes(64))
-            client.write(base + READY_OFFSET, bytes(64))
-            client.write(base + RELEASE_OFFSET, bytes(64))
+            client.write(backend_address(base, device_type), bytes(64))
+            client.write(backend_address(base + READY_OFFSET, device_type), bytes(64))
+            client.write(backend_address(base + RELEASE_OFFSET, device_type), bytes(64))
         guest_process = subprocess.Popen(qemu_argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                          stdin=subprocess.DEVNULL, env=qemu_environment,
                                          start_new_session=True, bufsize=0)
@@ -189,7 +210,7 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout):
                 raise RuntimeError("CXLMemSim exited before the test completed")
             for line in output.poll():
                 if line == "READY":
-                    if client.read_u64(64) != 1:
+                    if client.read_u64(backend_address(64, device_type)) != 1:
                         raise RuntimeError("guest handshake was not visible through CXLMemSim")
                     guest_ready = True
                 elif line.startswith("PACKET "):
@@ -225,7 +246,7 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout):
                 if ((mode == "corrupt-payload" and offset != 0)
                         or (mode == "early-ready" and not 1472 <= offset < 1500)):
                     raise RuntimeError(f"failure did not identify the injected byte range: {guest_failure}")
-                status = client.read_u64(64)
+                status = client.read_u64(backend_address(64, device_type))
                 if status < 0x100:
                     # UART can precede the guest's final status store.
                     time.sleep(0.001)
@@ -242,7 +263,8 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout):
                 continue
 
             for token in list(held):
-                if client.read_u64(slot_address(token) + RELEASE_OFFSET) == token.generation:
+                release = backend_address(slot_address(token) + RELEASE_OFFSET, device_type)
+                if client.read_u64(release) == token.generation:
                     protocol.release(token)
                     del held[token]
                     freed[token.flow].add(token.serial)
@@ -285,12 +307,13 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout):
                     data = bytes([data[0] ^ 0x80]) + data[1:]
                     corruption_done = True
                     result["fault_injected"] = True
-                client.write(address, data)
+                client.write(backend_address(address, device_type), data)
                 protocol.complete(write.op_id)
             if mode == "early-ready" and first_target is not None and not result["fault_injected"]:
                 waiting = [w for w in protocol.pending.values() if w.token == first_target]
                 if len(waiting) == 1 and waiting[0].kind == "payload" and waiting[0].offset == 1472:
-                    client.write_u64(slot_address(first_target) + READY_OFFSET, first_target.generation)
+                    ready = backend_address(slot_address(first_target) + READY_OFFSET, device_type)
+                    client.write_u64(ready, first_target.generation)
                     result["fault_injected"] = True
             protocol.check_invariants()
             if guest_done:
@@ -298,7 +321,7 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout):
                     raise RuntimeError("negative control incorrectly completed successfully")
                 if held or any(remaining.values()) or protocol.pending:
                     continue
-                status = client.read_u64(64)
+                status = client.read_u64(backend_address(64, device_type))
                 if status != 2:
                     continue
                 if not held_progress or consumed != {0: count, 1: count}:
@@ -326,8 +349,12 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout):
         save_trace(directory / "events.jsonl", protocol.trace)
         (directory / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     guest_log = (directory / "guest.log").read_text(errors="replace")
-    if ("Successfully connected to CXLMemSim" not in guest_log
-            or re.search(r"CXL Type3:.*(?:failed|Failed|denied|falling back)", guest_log)):
+    connected = ((device_type == "type3" and "Successfully connected to CXLMemSim" in guest_log)
+                 or (device_type == "type2"
+                     and "CXL Type2: Connected to CXLMemSim" in guest_log
+                     and "CXL Type2: Device realized" in guest_log))
+    if (not connected
+            or re.search(r"CXL Type[23]:.*(?:failed|Failed|denied|falling back)", guest_log)):
         result.update(status="failed", error="guest transport connection/fallback check failed")
         (directory / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
         raise RuntimeError(result["error"])
@@ -350,6 +377,7 @@ def main(argv=None):
     parser.add_argument("--guest", type=Path, default=ROOT / "build/integration/guest/consumer.elf")
     parser.add_argument("--packets-per-flow", type=int, default=16)
     parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--device-type", choices=("type2", "type3"), default="type3")
     parser.add_argument("--case", choices=("all", "adversarial", "early-ready", "corrupt-payload"), default="all")
     args = parser.parse_args(argv)
     if args.packets_per_flow < 4 or args.timeout <= 0:
@@ -357,7 +385,9 @@ def main(argv=None):
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
     result = {"status": "running", "cases": [], "pins": PINS,
-              "scope": "RISC-V guest functional publication over Type3 TCP; no NC-P/LLC/ISA proof"}
+              "device_type": args.device_type,
+              "scope": (f"RISC-V guest functional publication over {args.device_type.capitalize()} "
+                        "legacy TCP; no NC-P/LLC/ISA proof")}
     try:
         for name, revision in PINS.items():
             path = ROOT / "thirdparty" / name
@@ -379,7 +409,7 @@ def main(argv=None):
         for mode in cases:
             case = run_case(args.output / mode, args.qemu, args.server, args.guest,
                             ROOT / "thirdparty/cxlmemsim/qemu_integration/topology_simple.txt",
-                            mode, args.packets_per_flow, args.timeout)
+                            mode, args.packets_per_flow, args.timeout, args.device_type)
             result["cases"].append(case)
         result["status"] = "passed"
     except Exception as error:

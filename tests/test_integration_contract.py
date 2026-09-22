@@ -5,11 +5,34 @@ import struct
 import unittest
 
 from cxl_nic.checker import TraceViolation, validate_trace
-from cxl_nic.integration import pattern, slot_address, write_address
+from cxl_nic.integration import (backend_address, pattern, qemu_command,
+                                 slot_address, write_address)
 from cxl_nic.model import Config, Protocol, ProtocolError, Token, Write
 
 
 class GuestPatternTests(unittest.TestCase):
+    def test_type2_backend_avoids_the_bar4_command_register_aperture(self):
+        self.assertEqual(backend_address(0, "type3"), 0)
+        self.assertEqual(backend_address(0, "type2"), 0x200000)
+        self.assertEqual(backend_address(0x16000, "type2"), 0x216000)
+        with self.assertRaises(ValueError):
+            backend_address(0, "invalid")
+
+    def test_qemu_command_selects_one_explicit_endpoint_type(self):
+        type3 = qemu_command("qemu", "guest")
+        self.assertTrue(any(value.startswith("cxl-type3,") for value in type3))
+        self.assertFalse(any(value.startswith("cxl-type2,") for value in type3))
+        type2 = qemu_command("qemu", "guest", "type2", 12345)
+        devices = [value for value in type2 if value.startswith("cxl-type2,")]
+        self.assertEqual(len(devices), 1)
+        self.assertIn("cxlmemsim-port=12345", devices[0])
+        self.assertIn("gpu-mode=0", devices[0])
+        self.assertFalse(any(value.startswith("cxl-type3,") for value in type2))
+        for device, port in (("invalid", 12345), ("type2", None), ("type2", True),
+                             ("type2", 0), ("type2", 65536)):
+            with self.subTest(device=device, port=port), self.assertRaises(ValueError):
+                qemu_command("qemu", "guest", device, port)
+
     def test_pattern_golden_vectors_cover_endianness_flow_and_partial_word(self):
         vectors = (
             ((0, 0, 0, 16), "0000000000000000737a5367a08f5ab5"),
