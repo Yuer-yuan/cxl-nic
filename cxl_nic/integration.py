@@ -38,7 +38,7 @@ TYPE2_DPA_BASE = 0x200000
 INITIAL = {0: 254, 1: 510}
 FIELDS = ("flow", "serial", "slot", "generation", "length")
 PINS = {"qemu": "59727bed3113942d6b7e1f61b1c08e02cc44e1c4",
-        "cxlmemsim": "ebb744d0dd3fc17ce258eff925f2221100efa998"}
+        "cxlmemsim": "39c058fda30a1e6d91264ad4efe7398dbf640a3e"}
 
 
 def pattern(nonce, flow, serial, length):
@@ -141,11 +141,11 @@ def qemu_command(binary, guest, device_type="type3", port=None):
 
 
 def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
-             device_type="type3", data_path="legacy", ncp_sets=64, ncp_ways=8):
-    if data_path not in ("legacy", "ncp"):
-        raise ValueError("data_path must be legacy or ncp")
-    if data_path == "ncp" and device_type != "type2":
-        raise ValueError("NC-P data path requires a Type2 endpoint")
+             device_type="type3", data_path="legacy", llc_sets=64, llc_ways=8):
+    if data_path not in ("legacy", "ncp", "ddio"):
+        raise ValueError("data_path must be legacy, ncp, or ddio")
+    if data_path in ("ncp", "ddio") and device_type != "type2":
+        raise ValueError("modeled cache injection requires a Type2 endpoint")
     directory.mkdir()
     port = available_port()
     nonce = secrets.randbits(64)
@@ -162,8 +162,9 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
               "packets_per_flow": count, "device_type": device_type,
               "backend_dpa_base": backend_address(0, device_type),
               "data_path": data_path,
-              "backend": (f"explicit NC-P host-LLC model over {device_type.capitalize()} memory"
-                          if data_path == "ncp" else
+              "backend": ({"ncp": "explicit NC-P with NIC-memory backing",
+                           "ddio": "modeled DDIO with host-memory backing"}[data_path]
+                          if data_path != "legacy" else
                           f"legacy TCP authoritative {device_type.capitalize()} memory"),
               "fault_injected": False}
     protocol = Protocol(Config(), INITIAL)
@@ -182,8 +183,8 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                 client = Client(("127.0.0.1", port), timeout=min(5.0, timeout))
             except OSError:
                 time.sleep(0.05)
-        if data_path == "ncp":
-            client.configure_ncp(ncp_sets, ncp_ways)
+        if data_path != "legacy":
+            client.configure_host_llc(llc_sets, llc_ways)
         control = struct.pack("<8Q", MAGIC, nonce, count, INITIAL[0], INITIAL[1], 2, 4, 1500)
         client.write(backend_address(0, device_type), control)
         client.write(backend_address(64, device_type), bytes(64))
@@ -317,8 +318,8 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                     corruption_done = True
                     result["fault_injected"] = True
                 target_address = backend_address(address, device_type)
-                if data_path == "ncp" and write.kind in ("payload", "ready"):
-                    client.ncp_write(target_address, data)
+                if data_path != "legacy" and write.kind in ("payload", "ready"):
+                    (client.ncp_write if data_path == "ncp" else client.ddio_write)(target_address, data)
                 else:
                     client.write(target_address, data)
                 protocol.complete(write.op_id)
@@ -327,8 +328,8 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                 if len(waiting) == 1 and waiting[0].kind == "payload" and waiting[0].offset == 1472:
                     ready = backend_address(slot_address(first_target) + READY_OFFSET, device_type)
                     ready_data = struct.pack("<Q", first_target.generation)
-                    if data_path == "ncp":
-                        client.ncp_write(ready, ready_data)
+                    if data_path != "legacy":
+                        (client.ncp_write if data_path == "ncp" else client.ddio_write)(ready, ready_data)
                     else:
                         client.write(ready, ready_data)
                     result["fault_injected"] = True
@@ -352,14 +353,15 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
 
         result["producer_backend_reads"] = client.reads
         result["producer_backend_writes"] = client.writes
-        if data_path == "ncp":
-            ncp = client.query_ncp()
-            result["ncp"] = {**ncp, "configured_sets": ncp_sets,
-                             "configured_ways": ncp_ways}
-            if (ncp["pushes"] != client.ncp_writes
-                    or ncp["first_demands"] == 0
-                    or ncp["first_demand_hits"] > ncp["first_demands"]):
-                raise RuntimeError("NC-P completion or host first-demand evidence is inconsistent")
+        if data_path != "legacy":
+            cache = (client.query_ncp if data_path == "ncp" else client.query_ddio)()
+            completed = client.ncp_writes if data_path == "ncp" else client.ddio_writes
+            result[data_path] = {**cache, "configured_sets": llc_sets,
+                                 "configured_ways": llc_ways}
+            if (cache["pushes"] != completed
+                    or cache["first_demands"] == 0
+                    or cache["first_demand_hits"] > cache["first_demands"]):
+                raise RuntimeError("cache injection completion or first-demand evidence is inconsistent")
     except Exception as error:
         result.update(status="failed", error=repr(error))
         raise
@@ -403,18 +405,18 @@ def main(argv=None):
     parser.add_argument("--packets-per-flow", type=int, default=16)
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--device-type", choices=("type2", "type3"), default="type3")
-    parser.add_argument("--data-path", choices=("legacy", "ncp"), default="legacy")
-    parser.add_argument("--ncp-sets", type=int, default=64)
-    parser.add_argument("--ncp-ways", type=int, default=8)
+    parser.add_argument("--data-path", choices=("legacy", "ncp", "ddio"), default="legacy")
+    parser.add_argument("--host-llc-sets", "--ncp-sets", dest="host_llc_sets", type=int, default=64)
+    parser.add_argument("--host-llc-ways", "--ncp-ways", dest="host_llc_ways", type=int, default=8)
     parser.add_argument("--case", choices=("all", "adversarial", "early-ready", "corrupt-payload"), default="all")
     args = parser.parse_args(argv)
     if args.packets_per_flow < 4 or args.timeout <= 0:
         parser.error("at least four packets per flow and a positive timeout are required")
-    if args.data_path == "ncp" and args.device_type != "type2":
-        parser.error("--data-path ncp requires --device-type type2")
-    if (args.ncp_sets <= 0 or args.ncp_ways <= 0 or args.ncp_sets > 65536
-            or args.ncp_ways > 64 or args.ncp_sets * args.ncp_ways > 1048576):
-        parser.error("NC-P host LLC dimensions are out of range")
+    if args.data_path in ("ncp", "ddio") and args.device_type != "type2":
+        parser.error("modeled cache injection requires --device-type type2")
+    if (args.host_llc_sets <= 0 or args.host_llc_ways <= 0 or args.host_llc_sets > 65536
+            or args.host_llc_ways > 64 or args.host_llc_sets * args.host_llc_ways > 1048576):
+        parser.error("host LLC dimensions are out of range")
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
     result = {"status": "running", "cases": [], "pins": PINS,
@@ -422,7 +424,7 @@ def main(argv=None):
               "data_path": args.data_path,
               "scope": (f"RISC-V guest functional publication over {args.device_type.capitalize()} "
                         + ("explicit finite simulated host LLC; no physical LLC/ISA proof"
-                           if args.data_path == "ncp" else
+                           if args.data_path != "legacy" else
                            "legacy TCP; no NC-P/LLC/ISA proof"))}
     try:
         for name, revision in PINS.items():
@@ -446,7 +448,7 @@ def main(argv=None):
             case = run_case(args.output / mode, args.qemu, args.server, args.guest,
                             ROOT / "thirdparty/cxlmemsim/qemu_integration/topology_simple.txt",
                             mode, args.packets_per_flow, args.timeout, args.device_type,
-                            args.data_path, args.ncp_sets, args.ncp_ways)
+                            args.data_path, args.host_llc_sets, args.host_llc_ways)
             result["cases"].append(case)
         result["status"] = "passed"
     except Exception as error:

@@ -33,12 +33,13 @@ class GuestPatternTests(unittest.TestCase):
             with self.subTest(device=device, port=port), self.assertRaises(ValueError):
                 qemu_command("qemu", "guest", device, port)
 
-    def test_ncp_data_path_requires_type2(self):
+    def test_cache_injection_data_paths_require_type2(self):
         arguments = (None, None, None, None, None, "adversarial", 4, 1)
         with self.assertRaisesRegex(ValueError, "data_path"):
             run_case(*arguments, device_type="type2", data_path="unknown")
-        with self.assertRaisesRegex(ValueError, "Type2"):
-            run_case(*arguments, device_type="type3", data_path="ncp")
+        for data_path in ("ncp", "ddio"):
+            with self.subTest(data_path=data_path), self.assertRaisesRegex(ValueError, "Type2"):
+                run_case(*arguments, device_type="type3", data_path=data_path)
 
     def test_pattern_golden_vectors_cover_endianness_flow_and_partial_word(self):
         vectors = (

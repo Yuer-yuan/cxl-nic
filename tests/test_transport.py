@@ -134,6 +134,28 @@ class TransportTests(unittest.TestCase):
                 client.ncp_write(address, payload)
         self.assertEqual(stream.sent, [])
 
+    def test_ddio_write_and_query_use_separate_operations(self):
+        stats = (2, 128, 4, 3, 2, 1, 1, 0)
+        client, stream = self.make_client([
+            response(struct.pack("<QQ", 4, 1)), response(),
+            response(struct.pack("<8Q", *stats), old_value=1)])
+        client.configure_host_llc(4, 1)
+        client.ddio_write(64, b"dma")
+        observed = client.query_ddio()
+        self.assertEqual([request[0] for request in stream.sent], [20, 23, 24])
+        self.assertEqual(client.ddio_writes, 1)
+        self.assertEqual(observed["pushes"], 2)
+        self.assertEqual(observed["writebacks"], 0)
+        self.assertEqual(observed["first_demand_misses"], 1)
+
+    def test_ddio_rejects_invalid_write_before_sending(self):
+        client, stream = self.make_client()
+        for address, payload in ((0, b""), (0, bytearray(b"x")), (63, b"xx"),
+                                 (128, b"x"), (-1, b"x")):
+            with self.subTest(address=address, payload=payload), self.assertRaises(ValueError):
+                client.ddio_write(address, payload)
+        self.assertEqual(stream.sent, [])
+
     def test_inconsistent_ncp_query_counters_close_stream(self):
         data = struct.pack("<8Q", 1, 64, 1, 2, 0, 0, 0, 0)
         client, stream = self.make_client([response(data)])

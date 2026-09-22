@@ -49,4 +49,4 @@ prepare() {
 }
 
 prepare qemu 59727bed3113942d6b7e1f61b1c08e02cc44e1c4 git@github.com:Yuer-yuan/qemu-cxl-type2.git
-prepare cxlmemsim ebb744d0dd3fc17ce258eff925f2221100efa998 git@github.com:Yuer-yuan/CXLMemSim.git
+prepare cxlmemsim 39c058fda30a1e6d91264ad4efe7398dbf640a3e git@github.com:Yuer-yuan/CXLMemSim.git

@@ -11,6 +11,8 @@ NCP_STATS = struct.Struct("<8Q")
 OP_NCP_CONFIG = 20
 OP_NCP_WRITE = 21
 OP_NCP_QUERY = 22
+OP_DDIO_WRITE = 23
+OP_DDIO_QUERY = 24
 
 
 class TransportError(RuntimeError):
@@ -26,6 +28,7 @@ class Client:
         self.reads = 0
         self.writes = 0
         self.ncp_writes = 0
+        self.ddio_writes = 0
 
     def close(self):
         if not self.closed:
@@ -91,7 +94,7 @@ class Client:
     def write_u64(self, address, value):
         self.write(address, struct.pack("<Q", value))
 
-    def configure_ncp(self, sets, ways):
+    def configure_host_llc(self, sets, ways):
         if (type(sets) is not int or type(ways) is not int or sets <= 0 or ways <= 0
                 or sets > 65536 or ways > 64 or sets * ways > 1048576):
             raise ValueError("NC-P host LLC dimensions are out of range")
@@ -99,7 +102,10 @@ class Client:
         actual_sets, actual_ways = struct.unpack_from("<QQ", data)
         if (actual_sets, actual_ways) != (sets, ways):
             self.close()
-            raise TransportError("server returned a different NC-P host LLC configuration")
+            raise TransportError("server returned a different host LLC configuration")
+
+    def configure_ncp(self, sets, ways):
+        self.configure_host_llc(sets, ways)
 
     def ncp_write(self, address, data):
         if not isinstance(data, bytes) or not data:
@@ -107,8 +113,14 @@ class Client:
         self._request(OP_NCP_WRITE, address, len(data), data)
         self.ncp_writes += 1
 
-    def query_ncp(self):
-        latency, resident, data = self._exchange(OP_NCP_QUERY)
+    def ddio_write(self, address, data):
+        if not isinstance(data, bytes) or not data:
+            raise ValueError("DDIO write requires nonempty bytes")
+        self._request(OP_DDIO_WRITE, address, len(data), data)
+        self.ddio_writes += 1
+
+    def _query_host_llc(self, operation):
+        latency, resident, data = self._exchange(operation)
         values = NCP_STATS.unpack(data)
         result = dict(zip(("pushes", "push_bytes", "host_reads", "host_read_hits",
                            "first_demands", "first_demand_hits", "evictions", "writebacks"),
@@ -120,3 +132,9 @@ class Client:
             self.close()
             raise TransportError("server returned inconsistent NC-P counters")
         return result
+
+    def query_ncp(self):
+        return self._query_host_llc(OP_NCP_QUERY)
+
+    def query_ddio(self):
+        return self._query_host_llc(OP_DDIO_QUERY)
