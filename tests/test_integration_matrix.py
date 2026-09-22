@@ -8,12 +8,14 @@ from cxl_nic.integration_matrix import ARMS, compare_results
 
 
 def result(name):
-    path, sets, ways, case_selection, post_push = ARMS[name]
+    arm = ARMS[name]
+    path, sets, ways, case_selection = arm.path, arm.sets, arm.ways, arm.case
     pressure = name.endswith("pressure")
     withdraw = name == "ncp_withdraw"
-    misses = 188 if withdraw else (218 if pressure else 0)
+    gated = name == "ncp_gate"
+    misses = 156 if gated else (188 if withdraw else (218 if pressure else 0))
     writebacks = 220 if pressure and path == "ncp" else 0
-    nc_writes = 188 if withdraw else 0
+    nc_writes = 156 if gated else (188 if withdraw else 0)
     home = "nic" if path == "ncp" else "host"
     other = "host" if path == "ncp" else "nic"
     cases = [{"mode": "adversarial", "status": "passed",
@@ -25,7 +27,9 @@ def result(name):
                      "writebacks": writebacks,
                      "resident": 1 if pressure else 128,
                      "nc_writes": nc_writes,
-                     "nc_write_bytes": 12032 if withdraw else 0,
+                     "nc_write_bytes": 9000 if gated else (12032 if withdraw else 0),
+                     "gated_push_lines": 32 if gated else 0,
+                     "gated_nc_write_lines": 156 if gated else 0,
                      "backing_read_bytes": {home: misses * 64, other: 0},
                      "first_demand_backing_bytes": {home: misses * 64, other: 0},
                      "dirty_writeback_bytes": {home: writebacks * 64, other: 0},
@@ -36,7 +40,9 @@ def result(name):
         cases.extend(({"mode": "early-ready", "status": "expected_rejection"},
                       {"mode": "corrupt-payload", "status": "expected_rejection"}))
     return {"status": "passed", "device_type": "type2", "data_path": path,
-            "ncp_post_push": post_push, "pins": dict(PINS), "cases": cases}
+            "ncp_post_push": arm.post_push,
+            "ncp_gate_resident_lines": arm.gate_resident_lines,
+            "pins": dict(PINS), "cases": cases}
 
 
 class IntegrationMatrixTests(unittest.TestCase):
@@ -44,7 +50,7 @@ class IntegrationMatrixTests(unittest.TestCase):
         self.results = {name: result(name) for name in ARMS}
 
     def stats(self, name):
-        path = ARMS[name][0]
+        path = ARMS[name].path
         return self.results[name]["cases"][0][path]
 
     def test_accepts_matched_functional_and_pressure_evidence(self):
@@ -94,6 +100,12 @@ class IntegrationMatrixTests(unittest.TestCase):
         stats["first_demand_backing_bytes"]["nic"] = 0
         stats["backing_read_bytes"]["nic"] = 0
         with self.assertRaisesRegex(ValueError, "post-push NC-write"):
+            compare_results(self.results)
+
+    def test_rejects_gate_without_both_decisions(self):
+        stats = self.stats("ncp_gate")
+        stats["gated_push_lines"] = 0
+        with self.assertRaisesRegex(ValueError, "adaptive gate"):
             compare_results(self.results)
 
     def test_rejects_inconsistent_first_demand_accounting(self):

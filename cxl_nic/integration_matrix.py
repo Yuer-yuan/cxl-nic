@@ -7,6 +7,7 @@ Latency comparison remains in the deterministic timing model.
 """
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
@@ -17,12 +18,23 @@ import sys
 from .integration import PINS, ROOT
 
 
+@dataclass(frozen=True)
+class Arm:
+    path: str
+    sets: int
+    ways: int
+    case: str
+    post_push: str = "none"
+    gate_resident_lines: int | None = None
+
+
 ARMS = {
-    "ncp_default": ("ncp", 64, 8, "all", "none"),
-    "ddio_default": ("ddio", 64, 8, "all", "none"),
-    "ncp_pressure": ("ncp", 1, 1, "adversarial", "none"),
-    "ddio_pressure": ("ddio", 1, 1, "adversarial", "none"),
-    "ncp_withdraw": ("ncp", 64, 8, "adversarial", "before-ready"),
+    "ncp_default": Arm("ncp", 64, 8, "all"),
+    "ddio_default": Arm("ddio", 64, 8, "all"),
+    "ncp_pressure": Arm("ncp", 1, 1, "adversarial"),
+    "ddio_pressure": Arm("ddio", 1, 1, "adversarial"),
+    "ncp_withdraw": Arm("ncp", 64, 8, "adversarial", post_push="before-ready"),
+    "ncp_gate": Arm("ncp", 64, 8, "adversarial", gate_resident_lines=32),
 }
 EXPECTED_CASES = {
     "default": {"adversarial": "passed", "early-ready": "expected_rejection",
@@ -31,7 +43,7 @@ EXPECTED_CASES = {
 }
 COUNTERS = ("pushes", "push_bytes", "first_demands", "first_demand_hits",
             "first_demand_misses", "evictions", "writebacks", "resident",
-            "nc_writes", "nc_write_bytes")
+            "nc_writes", "nc_write_bytes", "gated_push_lines", "gated_nc_write_lines")
 TRAFFIC_COUNTERS = ("backing_read_bytes", "first_demand_backing_bytes",
                     "dirty_writeback_bytes", "producer_backing_write_bytes")
 
@@ -48,7 +60,8 @@ def _stats(result, path):
     stats = case.get(path)
     if not isinstance(stats, dict):
         raise ValueError(f"adversarial case has no {path} statistics")
-    missing = [name for name in COUNTERS if type(stats.get(name)) is not int]
+    missing = [name for name in COUNTERS
+               if type(stats.get(name)) is not int or stats.get(name, -1) < 0]
     if missing:
         raise ValueError(f"{path} statistics have invalid counters: {missing}")
     if stats["first_demand_hits"] + stats["first_demand_misses"] != stats["first_demands"]:
@@ -75,23 +88,25 @@ def compare_results(results):
         raise ValueError(f"matrix arms differ: expected {sorted(ARMS)}, got {sorted(results)}")
 
     stats = {}
-    for name, (path, sets, ways, case_selection, post_push) in ARMS.items():
+    for name, arm in ARMS.items():
         result = results[name]
         if result.get("status") != "passed":
             raise ValueError(f"{name} did not pass")
-        if result.get("device_type") != "type2" or result.get("data_path") != path:
+        if result.get("device_type") != "type2" or result.get("data_path") != arm.path:
             raise ValueError(f"{name} endpoint or data path differs from the matrix")
-        if result.get("ncp_post_push") != post_push:
+        if result.get("ncp_post_push") != arm.post_push:
             raise ValueError(f"{name} post-push policy differs from the matrix")
+        if result.get("ncp_gate_resident_lines") != arm.gate_resident_lines:
+            raise ValueError(f"{name} adaptive-gate policy differs from the matrix")
         if result.get("pins") != PINS:
             raise ValueError(f"{name} third-party pins differ from the audited revisions")
-        expected = EXPECTED_CASES["default" if case_selection == "all" else "pressure"]
+        expected = EXPECTED_CASES["default" if arm.case == "all" else "pressure"]
         actual = {case.get("mode"): case.get("status") for case in result.get("cases", ())}
         if len(result.get("cases", ())) != len(expected) or actual != expected:
             raise ValueError(f"{name} case outcomes differ: {actual}")
-        stats[name] = _stats(result, path)
-        if (stats[name].get("configured_sets") != sets
-                or stats[name].get("configured_ways") != ways):
+        stats[name] = _stats(result, arm.path)
+        if (stats[name].get("configured_sets") != arm.sets
+                or stats[name].get("configured_ways") != arm.ways):
             raise ValueError(f"{name} host LLC geometry differs")
 
     for suffix in ("default", "pressure"):
@@ -115,28 +130,36 @@ def compare_results(results):
     if stats["ddio_pressure"]["writebacks"] != 0:
         raise ValueError("DDIO clean eviction unexpectedly wrote back a line")
 
-    for name, (path, _sets, _ways, _case_selection, _post_push) in ARMS.items():
+    for name, policy in ARMS.items():
         arm = stats[name]
-        home = "nic" if path == "ncp" else "host"
-        other = "host" if path == "ncp" else "nic"
+        home = "nic" if policy.path == "ncp" else "host"
+        other = "host" if policy.path == "ncp" else "nic"
         if (arm["first_demand_backing_bytes"][home] != arm["first_demand_misses"] * 64
                 or arm["first_demand_backing_bytes"][other] != 0):
             raise ValueError(f"{name} first-demand misses used the wrong backing home")
         if (arm["dirty_writeback_bytes"][home] != arm["writebacks"] * 64
                 or arm["dirty_writeback_bytes"][other] != 0):
             raise ValueError(f"{name} dirty writebacks used the wrong backing home")
-        expected_producer = arm["pushes"] * 64 if path == "ddio" else 0
+        expected_producer = arm["pushes"] * 64 if policy.path == "ddio" else 0
         if (arm["producer_backing_write_bytes"] !=
                 {"host": expected_producer, "nic": arm["nc_writes"] * 64}):
             raise ValueError(f"{name} producer backing traffic differs")
-        if path == "ddio" and (arm["nc_writes"] or arm["nc_write_bytes"]):
+        if policy.path == "ddio" and (arm["nc_writes"] or arm["nc_write_bytes"]):
             raise ValueError(f"{name} unexpectedly used NC-write")
+        if name != "ncp_gate" and (arm["gated_push_lines"] or arm["gated_nc_write_lines"]):
+            raise ValueError(f"{name} unexpectedly used adaptive gating")
 
     withdrawn = stats["ncp_withdraw"]
     if (withdrawn["nc_writes"] <= 0
             or withdrawn["first_demand_misses"] < withdrawn["nc_writes"]
             or withdrawn["nc_write_bytes"] <= 0):
         raise ValueError("post-push NC-write did not force NIC-backing fallback")
+
+    gated = stats["ncp_gate"]
+    if (gated["gated_push_lines"] <= 0 or gated["gated_nc_write_lines"] <= 0
+            or gated["gated_nc_write_lines"] != gated["nc_writes"]
+            or gated["first_demand_misses"] < gated["gated_nc_write_lines"]):
+        raise ValueError("adaptive gate did not exercise both write policies")
 
     return {
         "status": "passed",
@@ -150,6 +173,7 @@ def compare_results(results):
             "backing_semantics": "passed",
             "backing_home_traffic": "passed",
             "post_push_withdrawal": "passed",
+            "adaptive_push_write_gate": "passed",
         },
         "arms": {name: _short(stats[name]) for name in ARMS},
     }
@@ -173,13 +197,15 @@ def main(argv=None):
     commands = []
     result = {"status": "running"}
     try:
-        for name, (path, sets, ways, case, post_push) in ARMS.items():
+        for name, arm in ARMS.items():
             command = [sys.executable, "-m", "cxl_nic.integration", "--device-type", "type2",
-                       "--data-path", path, "--host-llc-sets", str(sets),
-                       "--host-llc-ways", str(ways), "--case", case,
-                       "--ncp-post-push", post_push,
+                       "--data-path", arm.path, "--host-llc-sets", str(arm.sets),
+                       "--host-llc-ways", str(arm.ways), "--case", arm.case,
+                       "--ncp-post-push", arm.post_push,
                        "--packets-per-flow", str(args.packets_per_flow),
                        "--timeout", str(args.timeout), "--output", str(output / name)]
+            if arm.gate_resident_lines is not None:
+                command.extend(("--ncp-gate-resident-lines", str(arm.gate_resident_lines)))
             commands.append(command)
             completed = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
             (output / f"{name}.stdout.log").write_text(completed.stdout)

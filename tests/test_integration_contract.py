@@ -53,6 +53,19 @@ class GuestPatternTests(unittest.TestCase):
             run_case(*other, device_type="type2", data_path="ncp",
                      ncp_post_push="before-ready")
 
+    def test_adaptive_gate_is_scoped_and_separate_from_post_push(self):
+        arguments = (None, None, None, None, None, "adversarial", 4, 1)
+        for value in (-1, True, 1.5):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "ncp_gate_resident_lines"):
+                run_case(*arguments, device_type="type2", data_path="ncp",
+                         ncp_gate_resident_lines=value)
+        with self.assertRaisesRegex(ValueError, "adversarial NC-P"):
+            run_case(*arguments, device_type="type2", data_path="ddio",
+                     ncp_gate_resident_lines=8)
+        with self.assertRaisesRegex(ValueError, "separate policies"):
+            run_case(*arguments, device_type="type2", data_path="ncp",
+                     ncp_gate_resident_lines=8, ncp_post_push="before-ready")
+
     def test_pattern_golden_vectors_cover_endianness_flow_and_partial_word(self):
         vectors = (
             ((0, 0, 0, 16), "0000000000000000737a5367a08f5ab5"),

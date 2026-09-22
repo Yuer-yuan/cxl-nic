@@ -84,12 +84,19 @@ physical QEMU host cache.
 
 The matrix command runs both paths with the default 64-set/eight-way LLC and a
 one-set/one-way pressure case, plus an NC-P arm that issues payload NC-writes
-after push completion and before ready publication. It requires identical cache-injection work,
+after push completion and before ready publication. A second NC-P arm switches
+new payload lines from NC-P to NC-write once modeled LLC residency reaches 32
+lines. It requires identical cache-injection work,
 complete first-demand hits with the default geometry, misses under pressure,
 dirty NC-P writeback, clean DDIO eviction, and NIC-backing fallback after the
 post-push withdrawal. Pressure hit and eviction counts
 can vary with guest polling, so they are recorded without requiring equality;
 latency comparisons use the deterministic timing model below.
+
+The residency gate is an executable version of the paper's runtime push/write
+choice. It proves that both operations can safely coexist with ordered publication
+and exposes the resulting NIC-backing fallback. The threshold is a sensitivity
+parameter rather than a calibrated hardware occupancy signal.
 
 For an injected line that misses at first CPU demand, the server attributes the
 64-byte backing fill to NIC memory for NC-P and host memory for DDIO. It also

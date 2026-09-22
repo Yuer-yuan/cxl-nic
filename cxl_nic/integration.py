@@ -142,7 +142,7 @@ def qemu_command(binary, guest, device_type="type3", port=None):
 
 def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
              device_type="type3", data_path="legacy", llc_sets=64, llc_ways=8,
-             ncp_post_push="none"):
+             ncp_post_push="none", ncp_gate_resident_lines=None):
     if data_path not in ("legacy", "ncp", "ddio"):
         raise ValueError("data_path must be legacy, ncp, or ddio")
     if data_path in ("ncp", "ddio") and device_type != "type2":
@@ -151,6 +151,13 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
         raise ValueError("ncp_post_push must be none or before-ready")
     if ncp_post_push != "none" and (data_path != "ncp" or mode != "adversarial"):
         raise ValueError("post-push NC-write requires adversarial NC-P mode")
+    if (ncp_gate_resident_lines is not None
+            and (type(ncp_gate_resident_lines) is not int or ncp_gate_resident_lines < 0)):
+        raise ValueError("ncp_gate_resident_lines must be a nonnegative integer or None")
+    if ncp_gate_resident_lines is not None and (data_path != "ncp" or mode != "adversarial"):
+        raise ValueError("adaptive gating requires adversarial NC-P mode")
+    if ncp_gate_resident_lines is not None and ncp_post_push != "none":
+        raise ValueError("adaptive gating and post-push withdrawal are separate policies")
     directory.mkdir()
     port = available_port()
     nonce = secrets.randbits(64)
@@ -168,6 +175,7 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
               "backend_dpa_base": backend_address(0, device_type),
               "data_path": data_path,
               "ncp_post_push": ncp_post_push,
+              "ncp_gate_resident_lines": ncp_gate_resident_lines,
               "backend": ({"ncp": "explicit NC-P with NIC-memory backing",
                            "ddio": "modeled DDIO with host-memory backing"}[data_path]
                           if data_path != "legacy" else
@@ -219,6 +227,8 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
         held_progress = False
         withdrawn = set()
         withdrawal_lines = 0
+        gated_push_lines = 0
+        gated_nc_write_lines = 0
         rng = random.Random(0xC1A0)
 
         while True:
@@ -339,7 +349,16 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                     corruption_done = True
                     result["fault_injected"] = True
                 target_address = backend_address(address, device_type)
-                if data_path != "legacy" and write.kind in ("payload", "ready"):
+                if (data_path == "ncp" and write.kind == "payload"
+                        and ncp_gate_resident_lines is not None):
+                    resident = client.query_ncp()["resident"]
+                    if resident < ncp_gate_resident_lines:
+                        client.ncp_write(target_address, data)
+                        gated_push_lines += 1
+                    else:
+                        client.ncp_nc_write(target_address, data)
+                        gated_nc_write_lines += 1
+                elif data_path != "legacy" and write.kind in ("payload", "ready"):
                     (client.ncp_write if data_path == "ncp" else client.ddio_write)(target_address, data)
                 else:
                     client.write(target_address, data)
@@ -378,7 +397,9 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
             cache = (client.query_ncp if data_path == "ncp" else client.query_ddio)()
             cache.update(client.query_host_llc_traffic())
             cache.update(nc_writes=client.ncp_nc_writes,
-                         nc_write_bytes=client.ncp_nc_write_bytes)
+                         nc_write_bytes=client.ncp_nc_write_bytes,
+                         gated_push_lines=gated_push_lines,
+                         gated_nc_write_lines=gated_nc_write_lines)
             completed = client.ncp_writes if data_path == "ncp" else client.ddio_writes
             result[data_path] = {**cache, "configured_sets": llc_sets,
                                  "configured_ways": llc_ways}
@@ -404,7 +425,14 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                     and (withdrawal_lines != client.ncp_nc_writes
                          or cache["first_demand_misses"] < withdrawal_lines)):
                 raise RuntimeError("post-push NC-write did not force payload fallback")
+            if (ncp_gate_resident_lines is not None
+                    and (not gated_push_lines or not gated_nc_write_lines
+                         or gated_nc_write_lines != client.ncp_nc_writes
+                         or cache["first_demand_misses"] < gated_nc_write_lines)):
+                raise RuntimeError("adaptive gate did not exercise both push and NC-write")
             result["withdrawal_lines"] = withdrawal_lines
+            result["gate_decisions"] = {"push_lines": gated_push_lines,
+                                        "nc_write_lines": gated_nc_write_lines}
     except Exception as error:
         result.update(status="failed", error=repr(error))
         raise
@@ -452,6 +480,7 @@ def main(argv=None):
     parser.add_argument("--host-llc-sets", "--ncp-sets", dest="host_llc_sets", type=int, default=64)
     parser.add_argument("--host-llc-ways", "--ncp-ways", dest="host_llc_ways", type=int, default=8)
     parser.add_argument("--ncp-post-push", choices=("none", "before-ready"), default="none")
+    parser.add_argument("--ncp-gate-resident-lines", type=int)
     parser.add_argument("--case", choices=("all", "adversarial", "early-ready", "corrupt-payload"), default="all")
     args = parser.parse_args(argv)
     if args.packets_per_flow < 4 or args.timeout <= 0:
@@ -460,6 +489,12 @@ def main(argv=None):
         parser.error("modeled cache injection requires --device-type type2")
     if args.ncp_post_push != "none" and (args.data_path != "ncp" or args.case != "adversarial"):
         parser.error("--ncp-post-push requires --data-path ncp --case adversarial")
+    if args.ncp_gate_resident_lines is not None and args.ncp_gate_resident_lines < 0:
+        parser.error("--ncp-gate-resident-lines must be nonnegative")
+    if args.ncp_gate_resident_lines is not None and (args.data_path != "ncp" or args.case != "adversarial"):
+        parser.error("--ncp-gate-resident-lines requires --data-path ncp --case adversarial")
+    if args.ncp_gate_resident_lines is not None and args.ncp_post_push != "none":
+        parser.error("adaptive gating and post-push withdrawal are separate policies")
     if (args.host_llc_sets <= 0 or args.host_llc_ways <= 0 or args.host_llc_sets > 65536
             or args.host_llc_ways > 64 or args.host_llc_sets * args.host_llc_ways > 1048576):
         parser.error("host LLC dimensions are out of range")
@@ -469,6 +504,7 @@ def main(argv=None):
               "device_type": args.device_type,
               "data_path": args.data_path,
               "ncp_post_push": args.ncp_post_push,
+              "ncp_gate_resident_lines": args.ncp_gate_resident_lines,
               "scope": (f"RISC-V guest functional publication over {args.device_type.capitalize()} "
                         + ("explicit finite simulated host LLC; no physical LLC/ISA proof"
                            if args.data_path != "legacy" else
@@ -496,7 +532,7 @@ def main(argv=None):
                             ROOT / "thirdparty/cxlmemsim/qemu_integration/topology_simple.txt",
                             mode, args.packets_per_flow, args.timeout, args.device_type,
                             args.data_path, args.host_llc_sets, args.host_llc_ways,
-                            args.ncp_post_push)
+                            args.ncp_post_push, args.ncp_gate_resident_lines)
             result["cases"].append(case)
         result["status"] = "passed"
     except Exception as error:
