@@ -156,6 +156,28 @@ class TransportTests(unittest.TestCase):
                 client.ddio_write(address, payload)
         self.assertEqual(stream.sent, [])
 
+    def test_host_llc_traffic_query_preserves_backing_home(self):
+        counters = (128, 192, 64, 128, 0, 256, 320, 0)
+        client, stream = self.make_client([response(struct.pack("<8Q", *counters))])
+        observed = client.query_host_llc_traffic()
+        self.assertEqual([request[0] for request in stream.sent], [25])
+        self.assertEqual(observed, {
+            "backing_read_bytes": {"host": 128, "nic": 192},
+            "first_demand_backing_bytes": {"host": 64, "nic": 128},
+            "dirty_writeback_bytes": {"host": 0, "nic": 256},
+            "producer_backing_write_bytes": {"host": 320, "nic": 0},
+        })
+
+    def test_inconsistent_host_llc_traffic_closes_stream(self):
+        for counters in ((65, 0, 0, 0, 0, 0, 0, 0),
+                         (64, 0, 128, 0, 0, 0, 0, 0)):
+            with self.subTest(counters=counters):
+                client, stream = self.make_client([response(struct.pack("<8Q", *counters))])
+                with self.assertRaisesRegex(TransportError, "backing traffic"):
+                    client.query_host_llc_traffic()
+                self.assertTrue(client.closed)
+                self.assertEqual(stream.close_count, 1)
+
     def test_inconsistent_ncp_query_counters_close_stream(self):
         data = struct.pack("<8Q", 1, 64, 1, 2, 0, 0, 0, 0)
         client, stream = self.make_client([response(data)])

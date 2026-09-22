@@ -29,6 +29,8 @@ EXPECTED_CASES = {
 }
 COUNTERS = ("pushes", "push_bytes", "first_demands", "first_demand_hits",
             "first_demand_misses", "evictions", "writebacks", "resident")
+TRAFFIC_COUNTERS = ("backing_read_bytes", "first_demand_backing_bytes",
+                    "dirty_writeback_bytes", "producer_backing_write_bytes")
 
 
 def _case(result, mode):
@@ -48,6 +50,11 @@ def _stats(result, path):
         raise ValueError(f"{path} statistics have invalid counters: {missing}")
     if stats["first_demand_hits"] + stats["first_demand_misses"] != stats["first_demands"]:
         raise ValueError(f"{path} first-demand denominator is inconsistent")
+    for name in TRAFFIC_COUNTERS:
+        counter = stats.get(name)
+        if (not isinstance(counter, dict) or set(counter) != {"host", "nic"}
+                or any(type(value) is not int or value < 0 for value in counter.values())):
+            raise ValueError(f"{path} has invalid {name}")
     return stats
 
 
@@ -56,7 +63,7 @@ def _work(stats):
 
 
 def _short(stats):
-    return {name: stats[name] for name in COUNTERS}
+    return {name: stats[name] for name in COUNTERS + TRAFFIC_COUNTERS}
 
 
 def compare_results(results):
@@ -103,6 +110,21 @@ def compare_results(results):
     if stats["ddio_pressure"]["writebacks"] != 0:
         raise ValueError("DDIO clean eviction unexpectedly wrote back a line")
 
+    for name, (path, _sets, _ways, _case_selection) in ARMS.items():
+        arm = stats[name]
+        home = "nic" if path == "ncp" else "host"
+        other = "host" if path == "ncp" else "nic"
+        if (arm["first_demand_backing_bytes"][home] != arm["first_demand_misses"] * 64
+                or arm["first_demand_backing_bytes"][other] != 0):
+            raise ValueError(f"{name} first-demand misses used the wrong backing home")
+        if (arm["dirty_writeback_bytes"][home] != arm["writebacks"] * 64
+                or arm["dirty_writeback_bytes"][other] != 0):
+            raise ValueError(f"{name} dirty writebacks used the wrong backing home")
+        expected_producer = arm["pushes"] * 64 if path == "ddio" else 0
+        if (arm["producer_backing_write_bytes"] !=
+                {"host": expected_producer, "nic": 0}):
+            raise ValueError(f"{name} producer backing traffic differs")
+
     return {
         "status": "passed",
         "scope": ("matched functional guest integration with a finite simulated host LLC; "
@@ -113,6 +135,7 @@ def compare_results(results):
             "default_first_demand_hits": "passed",
             "pressure_eviction": "passed",
             "backing_semantics": "passed",
+            "backing_home_traffic": "passed",
         },
         "arms": {name: _short(stats[name]) for name in ARMS},
     }

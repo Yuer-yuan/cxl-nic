@@ -8,11 +8,13 @@ import time
 REQUEST = struct.Struct("<BQQQQQ64s")
 RESPONSE = struct.Struct("<BQQ64s")
 NCP_STATS = struct.Struct("<8Q")
+HOST_LLC_TRAFFIC = struct.Struct("<8Q")
 OP_NCP_CONFIG = 20
 OP_NCP_WRITE = 21
 OP_NCP_QUERY = 22
 OP_DDIO_WRITE = 23
 OP_DDIO_QUERY = 24
+OP_HOST_LLC_TRAFFIC_QUERY = 25
 
 
 class TransportError(RuntimeError):
@@ -138,3 +140,20 @@ class Client:
 
     def query_ddio(self):
         return self._query_host_llc(OP_DDIO_QUERY)
+
+    def query_host_llc_traffic(self):
+        _, _, data = self._exchange(OP_HOST_LLC_TRAFFIC_QUERY)
+        values = HOST_LLC_TRAFFIC.unpack(data)
+        result = {
+            "backing_read_bytes": {"host": values[0], "nic": values[1]},
+            "first_demand_backing_bytes": {"host": values[2], "nic": values[3]},
+            "dirty_writeback_bytes": {"host": values[4], "nic": values[5]},
+            "producer_backing_write_bytes": {"host": values[6], "nic": values[7]},
+        }
+        flat = [value for counter in result.values() for value in counter.values()]
+        if (any(value % 64 for value in flat)
+                or any(result["first_demand_backing_bytes"][home]
+                       > result["backing_read_bytes"][home] for home in ("host", "nic"))):
+            self.close()
+            raise TransportError("server returned inconsistent host LLC backing traffic")
+        return result

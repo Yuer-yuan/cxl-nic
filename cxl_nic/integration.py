@@ -38,7 +38,7 @@ TYPE2_DPA_BASE = 0x200000
 INITIAL = {0: 254, 1: 510}
 FIELDS = ("flow", "serial", "slot", "generation", "length")
 PINS = {"qemu": "59727bed3113942d6b7e1f61b1c08e02cc44e1c4",
-        "cxlmemsim": "39c058fda30a1e6d91264ad4efe7398dbf640a3e"}
+        "cxlmemsim": "062e165dbae882eb5857d40ab0b445f0f769652e"}
 
 
 def pattern(nonce, flow, serial, length):
@@ -355,6 +355,7 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
         result["producer_backend_writes"] = client.writes
         if data_path != "legacy":
             cache = (client.query_ncp if data_path == "ncp" else client.query_ddio)()
+            cache.update(client.query_host_llc_traffic())
             completed = client.ncp_writes if data_path == "ncp" else client.ddio_writes
             result[data_path] = {**cache, "configured_sets": llc_sets,
                                  "configured_ways": llc_ways}
@@ -362,6 +363,20 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                     or cache["first_demands"] == 0
                     or cache["first_demand_hits"] > cache["first_demands"]):
                 raise RuntimeError("cache injection completion or first-demand evidence is inconsistent")
+            first_backing = cache["first_demand_backing_bytes"]
+            dirty_backing = cache["dirty_writeback_bytes"]
+            producer_backing = cache["producer_backing_write_bytes"]
+            expected_home = "nic" if data_path == "ncp" else "host"
+            other_home = "host" if data_path == "ncp" else "nic"
+            if (first_backing[expected_home] != cache["first_demand_misses"] * 64
+                    or first_backing[other_home] != 0
+                    or dirty_backing[expected_home] != cache["writebacks"] * 64
+                    or dirty_backing[other_home] != 0
+                    or cache["backing_read_bytes"][expected_home] < first_backing[expected_home]
+                    or cache["backing_read_bytes"][other_home] != 0
+                    or producer_backing["nic"] != 0
+                    or producer_backing["host"] != (completed * 64 if data_path == "ddio" else 0)):
+                raise RuntimeError("cache backing-home traffic is inconsistent")
     except Exception as error:
         result.update(status="failed", error=repr(error))
         raise

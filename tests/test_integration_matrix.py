@@ -10,14 +10,23 @@ from cxl_nic.integration_matrix import ARMS, compare_results
 def result(name):
     path, sets, ways, case_selection = ARMS[name]
     pressure = name.endswith("pressure")
+    misses = 218 if pressure else 0
+    writebacks = 220 if pressure and path == "ncp" else 0
+    home = "nic" if path == "ncp" else "host"
+    other = "host" if path == "ncp" else "nic"
     cases = [{"mode": "adversarial", "status": "passed",
               path: {"configured_sets": sets, "configured_ways": ways,
                      "pushes": 220, "push_bytes": 12288, "first_demands": 220,
                      "first_demand_hits": 2 if pressure else 220,
-                     "first_demand_misses": 218 if pressure else 0,
+                     "first_demand_misses": misses,
                      "evictions": 900 if pressure else 1,
-                     "writebacks": 220 if pressure and path == "ncp" else 0,
-                     "resident": 1 if pressure else 128}}]
+                     "writebacks": writebacks,
+                     "resident": 1 if pressure else 128,
+                     "backing_read_bytes": {home: misses * 64, other: 0},
+                     "first_demand_backing_bytes": {home: misses * 64, other: 0},
+                     "dirty_writeback_bytes": {home: writebacks * 64, other: 0},
+                     "producer_backing_write_bytes":
+                         {"host": 220 * 64 if path == "ddio" else 0, "nic": 0}}}]
     if case_selection == "all":
         cases.extend(({"mode": "early-ready", "status": "expected_rejection"},
                       {"mode": "corrupt-payload", "status": "expected_rejection"}))
@@ -60,6 +69,17 @@ class IntegrationMatrixTests(unittest.TestCase):
     def test_rejects_ddio_dirty_writeback(self):
         self.stats("ddio_pressure")["writebacks"] = 1
         with self.assertRaisesRegex(ValueError, "clean eviction"):
+            compare_results(self.results)
+
+    def test_rejects_first_demand_from_wrong_backing_home(self):
+        stats = self.stats("ncp_pressure")
+        stats["first_demand_backing_bytes"] = {"host": 218 * 64, "nic": 0}
+        with self.assertRaisesRegex(ValueError, "wrong backing home"):
+            compare_results(self.results)
+
+    def test_rejects_ddio_without_host_backing_write(self):
+        self.stats("ddio_default")["producer_backing_write_bytes"]["host"] = 0
+        with self.assertRaisesRegex(ValueError, "producer backing traffic"):
             compare_results(self.results)
 
     def test_rejects_inconsistent_first_demand_accounting(self):

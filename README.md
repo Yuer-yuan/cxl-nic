@@ -77,7 +77,8 @@ clean line in the same LLC model, so a clean eviction needs no writeback. Both m
 use the same Type2 transport harness, reorder protocol, addresses and cache geometry;
 `ddio` therefore models the data-placement difference and is not a physical PCIe
 DDIO implementation. Results report completion, all host read hits, first-demand
-hits, evictions, writebacks and residency. `--data-path legacy` remains the default
+hits, evictions, writebacks, residency, and 64-byte backing transactions separated
+by host versus NIC home. `--data-path legacy` remains the default
 regression path. These are executable simulator mechanisms and do not manipulate a
 physical QEMU host cache.
 
@@ -87,6 +88,12 @@ complete first-demand hits with the default geometry, misses under pressure,
 dirty NC-P writeback, and clean DDIO eviction. Pressure hit and eviction counts
 can vary with guest polling, so they are recorded without requiring equality;
 latency comparisons use the deterministic timing model below.
+
+For an injected line that misses at first CPU demand, the server attributes the
+64-byte backing fill to NIC memory for NC-P and host memory for DDIO. It also
+separates dirty eviction traffic from the producer's write-through traffic. These
+are executed simulator counters; they do not represent measured physical CXL or
+DRAM bandwidth.
 
 Omit `--install-deps` when the build dependencies are already installed. Use
 `JOBS=8` to set build parallelism. No guest Linux image is required.
