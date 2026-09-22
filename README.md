@@ -188,6 +188,19 @@ Run the deterministic policy matrix on Giga:
 bash scripts/verify_timing.sh results/timing-run-001
 ```
 
+Run the controlled sensitivity sweep after the matrix passes:
+
+```bash
+bash scripts/verify_timing_sweep.sh results/timing-sweep-001
+```
+
+The sweep holds 64 packets per case and varies one experimental axis: NC-P gate
+threshold, normalized LLC capacity, CPU base service, fixed packet size, or flow
+count. Every case runs B1, D1, D1-gated and D1-host-control on the same workload.
+It reports payload and background hit rates, background misses per virtual
+microsecond, backing and link traffic, buffer/credit pressure and p50/p99 ordered
+delivery latency. These are sensitivity results rather than hardware predictions.
+
 The input workload contains complete packets with sender sequence numbers. Packets
 can be delayed and arrive out of order, but every serial eventually arrives exactly
 once. Permanent loss, retransmission, checksums, timeout recovery and congestion
@@ -229,7 +242,8 @@ the all-NC-P endpoint must be identical to D1. Packet stride
 is expressed in cache lines; 128 and 129 line strides expose sensitivity to the
 model's simple modulo set mapping. It records ordered-delivery p50/p99 latency,
 first payload-line hit rate, push-to-demand distance, premature absence, credit
-stalls, NIC/CPU buffer occupancy and producer/CPU link bytes. B1 and the host-backed
+stalls, NIC/CPU buffer occupancy, background-reference hit rate, backing traffic,
+and producer/CPU link bytes. B1 and the host-backed
 D1 control must be exactly equal whenever their admission and withdrawal policies
 match.
 

@@ -244,6 +244,15 @@ def _nearest_rank(values, percentile):
     return ordered[max(0, math.ceil(percentile * len(ordered)) - 1)]
 
 
+def _read_summary(cache_snapshot, category):
+    counts = cache_snapshot["stats"]["reads"].get(category)
+    hits = 0 if counts is None else counts["hits"]
+    misses = 0 if counts is None else counts["misses"]
+    accesses = hits + misses
+    return {"hits": hits, "misses": misses, "accesses": accesses,
+            "hit_rate": hits / accesses if accesses else None}
+
+
 class Simulation:
     """One policy arm; all event timestamps are integer virtual nanoseconds."""
 
@@ -655,6 +664,7 @@ class Simulation:
             if (bypass["lines"] != self.gated_nc_write_lines
                     or bypass["bytes"] != self.gated_nc_write_lines * LINE_BYTES):
                 raise TimingError("adaptive NC-write bypass accounting is inconsistent")
+        traffic = cache_before_flush["stats"]
         if self.link_bytes != self.producer_link_bytes + self.cpu_nic_read_bytes:
             raise TimingError("modeled link-byte classes do not sum to the total")
         if self.policy.use_credit and any(
@@ -690,6 +700,12 @@ class Simulation:
             "payload_first_demand": {"hits": self.first_hits, "misses": self.first_misses,
                                      "lines": lines,
                                      "hit_rate": self.first_hits / lines if lines else None},
+            "background_demand": _read_summary(cache_before_flush, "background"),
+            "backing_traffic_bytes": {
+                "reads": traffic["backing_read_bytes"],
+                "writes_before_final_flush": traffic["backing_write_bytes"],
+                "dirty_evictions": traffic["dirty_eviction_bytes"],
+                "nc_write_bypass": traffic["bypass"]["bytes"]},
             "admitted_absent_at_first_demand": self.admitted_absent,
             "link_bytes": self.link_bytes,
             "producer_link_bytes": self.producer_link_bytes,
@@ -726,7 +742,8 @@ def _comparable(result):
     return {key: result[key] for key in (
         "packets", "payload_bytes", "duration_ns", "throughput_gbps",
         "delivery_latency_ns", "sequence_wait_ns", "push_to_first_demand_ns",
-        "payload_first_demand", "admitted_absent_at_first_demand", "link_bytes",
+        "payload_first_demand", "background_demand", "backing_traffic_bytes",
+        "admitted_absent_at_first_demand", "link_bytes",
         "producer_link_bytes", "cpu_nic_read_bytes", "payload_push_bytes",
         "adaptive_gate",
         "link_busy_until_ns", "nic_buffer_peak_bytes",

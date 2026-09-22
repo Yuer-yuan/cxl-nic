@@ -146,6 +146,21 @@ class TimingPolicyTests(unittest.TestCase):
         self.assertEqual(withdrawn["payload_first_demand"]["misses"], 1)
         self.assertEqual(withdrawn["withdrawn_payload_lines"], 1)
 
+    def test_background_and_backing_traffic_have_explicit_denominators(self):
+        result = Simulation(
+            (packet(0, 0), packet(1, 20)), "D1",
+            config(background_interval_ns=5, background_working_set_lines=4)).run()
+        background = result["background_demand"]
+        self.assertGreater(background["accesses"], 0)
+        self.assertEqual(background["hits"] + background["misses"],
+                         background["accesses"])
+        self.assertEqual(background["hit_rate"],
+                         background["hits"] / background["accesses"])
+        traffic = result["backing_traffic_bytes"]
+        self.assertEqual(set(traffic), {"reads", "writes_before_final_flush",
+                                        "dirty_evictions", "nc_write_bypass"})
+        self.assertEqual(traffic["nc_write_bypass"], 0)
+
     def test_adaptive_gate_endpoints_and_mixed_choice_preserve_delivery(self):
         workload = tuple(packet(serial, 0) for serial in range(4))
         all_nc_write = Simulation(
@@ -174,7 +189,8 @@ class TimingPolicyTests(unittest.TestCase):
         for key in ("duration_ns", "delivery_latency_ns", "sequence_wait_ns",
                     "push_to_first_demand_ns", "payload_first_demand", "link_bytes",
                     "producer_link_bytes", "cpu_nic_read_bytes", "payload_push_bytes",
-                    "credit_stall_ns", "packet_records", "cache_before_final_flush"):
+                    "background_demand", "backing_traffic_bytes", "credit_stall_ns",
+                    "packet_records", "cache_before_final_flush"):
             with self.subTest(key=key):
                 self.assertEqual(all_ncp[key], baseline[key])
 

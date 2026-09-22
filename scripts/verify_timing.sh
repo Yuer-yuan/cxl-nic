@@ -110,7 +110,8 @@ if (gate_full['adaptive_gate']['nc_write_lines'] != 0
 for key in ('duration_ns', 'delivery_latency_ns', 'sequence_wait_ns',
             'push_to_first_demand_ns', 'payload_first_demand', 'link_bytes',
             'producer_link_bytes', 'cpu_nic_read_bytes', 'payload_push_bytes',
-            'credit_stall_ns', 'packet_records', 'cache_before_final_flush'):
+            'background_demand', 'backing_traffic_bytes', 'credit_stall_ns',
+            'packet_records', 'cache_before_final_flush'):
     if gate_full[key] != results['gate-0513']['arms']['D1'][key]:
         raise SystemExit(f'above-capacity gate changed D1 behavior: {key}')
 
@@ -118,12 +119,14 @@ def short(arm):
     return {'p50_ns': arm['delivery_latency_ns']['p50'],
             'p99_ns': arm['delivery_latency_ns']['p99'],
             'first_hit_rate': arm['payload_first_demand']['hit_rate'],
+            'background_hit_rate': arm['background_demand']['hit_rate'],
             'prematurely_absent_lines': arm['admitted_absent_at_first_demand'],
             'producer_link_bytes': arm['producer_link_bytes'],
             'cpu_nic_read_bytes': arm['cpu_nic_read_bytes'],
             'cpu_reorder_buffer_peak_bytes': arm['cpu_reorder_buffer_peak_bytes'],
             'credit_stall_ns': sum(arm['credit_stall_ns'].values()),
-            'adaptive_gate': arm['adaptive_gate']}
+            'adaptive_gate': arm['adaptive_gate'],
+            'backing_traffic_bytes': arm['backing_traffic_bytes']}
 
 summary = {
     'status': 'passed',
