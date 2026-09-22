@@ -1,6 +1,7 @@
 """Wire compatibility and fail-closed checks for CXLMemSim TCP requests."""
 
 import socket
+import struct
 import unittest
 from unittest.mock import patch
 
@@ -99,6 +100,47 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(stream.sent[0][41:49], encoded)
         self.assertEqual(client.read_u64(64), 0x0123456789ABCDEF)
         self.assertEqual((client.reads, client.writes), (1, 1))
+
+    def test_ncp_configuration_write_and_query_have_distinct_wire_operations(self):
+        stats = (3, 129, 11, 9, 3, 2, 1, 1)
+        replies = [response(struct.pack("<QQ", 8, 2)), response(),
+                   response(struct.pack("<8Q", *stats), latency=17, old_value=5)]
+        client, stream = self.make_client(replies)
+        with patch("cxl_nic.transport.time.monotonic_ns", return_value=0):
+            client.configure_ncp(8, 2)
+            client.ncp_write(64, b"push")
+            observed = client.query_ncp()
+        self.assertEqual([request[0] for request in stream.sent], [20, 21, 22])
+        self.assertEqual(int.from_bytes(stream.sent[0][25:33], "little"), 8)
+        self.assertEqual(int.from_bytes(stream.sent[0][33:41], "little"), 2)
+        self.assertEqual(stream.sent[1][1:17], (64).to_bytes(8, "little") + (4).to_bytes(8, "little"))
+        self.assertEqual(stream.sent[1][41:45], b"push")
+        self.assertEqual(client.ncp_writes, 1)
+        self.assertEqual(observed, {
+            "pushes": 3, "push_bytes": 129, "host_reads": 11, "host_read_hits": 9,
+            "first_demands": 3, "first_demand_hits": 2, "evictions": 1,
+            "writebacks": 1, "resident": 5, "query_latency_ns": 17,
+            "host_read_misses": 2, "first_demand_misses": 1})
+
+    def test_ncp_rejects_invalid_configuration_and_write_before_sending(self):
+        client, stream = self.make_client()
+        for sets, ways in ((0, 1), (1, 0), (True, 1), (1, True),
+                           (65537, 1), (1, 65), (65536, 17)):
+            with self.subTest(sets=sets, ways=ways), self.assertRaises(ValueError):
+                client.configure_ncp(sets, ways)
+        for address, payload in ((0, b""), (0, bytearray(b"x")), (63, b"xx"),
+                                 (128, b"x"), (-1, b"x")):
+            with self.subTest(address=address, payload=payload), self.assertRaises(ValueError):
+                client.ncp_write(address, payload)
+        self.assertEqual(stream.sent, [])
+
+    def test_inconsistent_ncp_query_counters_close_stream(self):
+        data = struct.pack("<8Q", 1, 64, 1, 2, 0, 0, 0, 0)
+        client, stream = self.make_client([response(data)])
+        with self.assertRaisesRegex(TransportError, "inconsistent NC-P counters"):
+            client.query_ncp()
+        self.assertTrue(client.closed)
+        self.assertEqual(stream.close_count, 1)
 
     def test_status_error_closes_stream_and_does_not_count_write(self):
         client, stream = self.make_client([response(status=7)])

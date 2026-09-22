@@ -7,6 +7,10 @@ import time
 
 REQUEST = struct.Struct("<BQQQQQ64s")
 RESPONSE = struct.Struct("<BQQ64s")
+NCP_STATS = struct.Struct("<8Q")
+OP_NCP_CONFIG = 20
+OP_NCP_WRITE = 21
+OP_NCP_QUERY = 22
 
 
 class TransportError(RuntimeError):
@@ -21,6 +25,7 @@ class Client:
         self.closed = False
         self.reads = 0
         self.writes = 0
+        self.ncp_writes = 0
 
     def close(self):
         if not self.closed:
@@ -33,15 +38,19 @@ class Client:
     def __exit__(self, *unused):
         self.close()
 
-    def _request(self, op, address=0, size=0, data=b""):
+    def _exchange(self, op, address=0, size=0, data=b"", value=0, expected=0):
         if (type(address) is not int or type(size) is not int
                 or address < 0 or size < 0 or address + size > self.capacity
                 or size > 64 or (size and address // 64 != (address + size - 1) // 64)):
             raise ValueError("request must stay within one cache line and the DPA capacity")
+        if (type(op) is not int or not 0 <= op <= 255
+                or type(value) is not int or not 0 <= value < 1 << 64
+                or type(expected) is not int or not 0 <= expected < 1 << 64):
+            raise ValueError("operation and request values must be unsigned wire integers")
         if self.closed:
             raise TransportError("transport is closed")
         try:
-            self.socket.sendall(REQUEST.pack(op, address, size, time.monotonic_ns(), 0, 0,
+            self.socket.sendall(REQUEST.pack(op, address, size, time.monotonic_ns(), value, expected,
                                             data.ljust(64, b"\0")))
             chunks = bytearray()
             while len(chunks) < RESPONSE.size:
@@ -49,7 +58,7 @@ class Client:
                 if not part:
                     raise TransportError("server closed before a complete response")
                 chunks.extend(part)
-            status, _, _, response = RESPONSE.unpack(chunks)
+            status, latency, old_value, response = RESPONSE.unpack(chunks)
             if status != 0:
                 raise TransportError(f"server returned status {status} for op {op}")
         except (OSError, TransportError) as error:
@@ -58,7 +67,10 @@ class Client:
             if isinstance(error, TransportError):
                 raise
             raise TransportError(str(error)) from error
-        return response[:size]
+        return latency, old_value, response
+
+    def _request(self, op, address=0, size=0, data=b"", value=0, expected=0):
+        return self._exchange(op, address, size, data, value, expected)[2][:size]
 
     def read(self, address, size):
         if type(size) is not int or size <= 0:
@@ -78,3 +90,33 @@ class Client:
 
     def write_u64(self, address, value):
         self.write(address, struct.pack("<Q", value))
+
+    def configure_ncp(self, sets, ways):
+        if (type(sets) is not int or type(ways) is not int or sets <= 0 or ways <= 0
+                or sets > 65536 or ways > 64 or sets * ways > 1048576):
+            raise ValueError("NC-P host LLC dimensions are out of range")
+        _, _, data = self._exchange(OP_NCP_CONFIG, value=sets, expected=ways)
+        actual_sets, actual_ways = struct.unpack_from("<QQ", data)
+        if (actual_sets, actual_ways) != (sets, ways):
+            self.close()
+            raise TransportError("server returned a different NC-P host LLC configuration")
+
+    def ncp_write(self, address, data):
+        if not isinstance(data, bytes) or not data:
+            raise ValueError("NC-P write requires nonempty bytes")
+        self._request(OP_NCP_WRITE, address, len(data), data)
+        self.ncp_writes += 1
+
+    def query_ncp(self):
+        latency, resident, data = self._exchange(OP_NCP_QUERY)
+        values = NCP_STATS.unpack(data)
+        result = dict(zip(("pushes", "push_bytes", "host_reads", "host_read_hits",
+                           "first_demands", "first_demand_hits", "evictions", "writebacks"),
+                          values))
+        result.update(resident=resident, query_latency_ns=latency,
+                      host_read_misses=result["host_reads"] - result["host_read_hits"],
+                      first_demand_misses=result["first_demands"] - result["first_demand_hits"])
+        if result["host_read_misses"] < 0 or result["first_demand_misses"] < 0:
+            self.close()
+            raise TransportError("server returned inconsistent NC-P counters")
+        return result

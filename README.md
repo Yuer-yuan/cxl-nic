@@ -56,9 +56,23 @@ python3 -m cxl_nic.integration --output results/integration-run-001
 ```
 
 Use `--device-type type2` to run the same functional publication suite through
-the pinned QEMU Type2 device. The default remains `type3`. Both modes use the
-legacy authoritative TCP memory path; Type2 selection alone does not exercise
-NC-P or prove host LLC placement.
+the pinned QEMU Type2 device. The default remains `type3`. Add `--data-path ncp`
+to send packet payload and ready publication through an explicit NC-P operation:
+
+```bash
+python3 -m cxl_nic.integration --device-type type2 --data-path ncp \
+    --ncp-sets 64 --ncp-ways 8 --output results/integration-ncp-001
+```
+
+In NC-P mode, QEMU registers its Type2 connection as the host requester and
+CXLMemSim installs pushed cache lines in a finite set-associative host-LLC model.
+NC-P completion is returned only after the line is installed. A host demand hit
+is served from that line; conflict eviction writes a dirty line to NIC-memory
+backing, while an ordinary NC-write writes back and withdraws a resident line.
+Results report push completion, all host read hits, first-demand hits, evictions,
+writebacks and residency. `--data-path legacy` remains the default regression
+path. This is an executable simulator mechanism and does not claim to manipulate
+a physical QEMU host cache.
 
 Omit `--install-deps` when the build dependencies are already installed. Use
 `JOBS=8` to set build parallelism. No guest Linux image is required.
@@ -214,11 +228,12 @@ These checks exercise the shared functional contract intended for both PCIe NIC
 reordering plus delayed DMA/DDIO and CXL NIC reordering plus delayed NC-P. They do
 not implement either NIC transport or measure their performance. The guest path
 supports the pinned Type2 and Type3 legacy TCP endpoints, whose backend responses
-provide authoritative data for guest reads. It validates publication, data delivery
-and ownership with actual guest loads/stores, but does not establish CXL.cache/NC-P
-semantics, physical CPU memory ordering or hardware LLC residency/hit rate. The
-separate cache replay explores explicit cache assumptions. Guest fences are
-exercised under QEMU TCG;
+provide authoritative data for guest reads. Type2 NC-P mode additionally exercises
+an explicit push/completion operation and finite simulated host LLC. It validates
+publication, data delivery, ownership, modeled first-demand hits and dirty
+writebacks with actual guest loads/stores, but does not establish physical CPU
+memory ordering or hardware LLC residency/hit rate. Guest fences are exercised
+under QEMU TCG;
 weak-memory behavior still needs separate validation.
 
 Bounded and seeded schedules are evidence for the tested cases, not a formal proof

@@ -1,7 +1,7 @@
 """RISC-V guest validation over a pinned CXLMemSim Type2 or Type3 endpoint.
 
-This exercises publication and ownership using real guest loads/stores, without
-claiming a physical CXL.cache, NC-P, LLC, or weak-memory implementation.
+The Type2 NC-P mode sends explicit push operations into CXLMemSim's finite host
+LLC model. It remains a simulator mechanism, not a physical CPU-cache claim.
 """
 
 import argparse
@@ -37,8 +37,8 @@ RELEASE_OFFSET = 128
 TYPE2_DPA_BASE = 0x200000
 INITIAL = {0: 254, 1: 510}
 FIELDS = ("flow", "serial", "slot", "generation", "length")
-PINS = {"qemu": "8776c8379a20033d913c55099fc87cabdf9d9e30",
-        "cxlmemsim": "3ade2316bc09a30e4050be56e2919310b2baa3c8"}
+PINS = {"qemu": "59727bed3113942d6b7e1f61b1c08e02cc44e1c4",
+        "cxlmemsim": "ebb744d0dd3fc17ce258eff925f2221100efa998"}
 
 
 def pattern(nonce, flow, serial, length):
@@ -141,7 +141,11 @@ def qemu_command(binary, guest, device_type="type3", port=None):
 
 
 def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
-             device_type="type3"):
+             device_type="type3", data_path="legacy", ncp_sets=64, ncp_ways=8):
+    if data_path not in ("legacy", "ncp"):
+        raise ValueError("data_path must be legacy or ncp")
+    if data_path == "ncp" and device_type != "type2":
+        raise ValueError("NC-P data path requires a Type2 endpoint")
     directory.mkdir()
     port = available_port()
     nonce = secrets.randbits(64)
@@ -157,7 +161,10 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
               "qemu_argv": qemu_argv, "server_argv": server_argv,
               "packets_per_flow": count, "device_type": device_type,
               "backend_dpa_base": backend_address(0, device_type),
-              "backend": f"legacy TCP authoritative {device_type.capitalize()} memory",
+              "data_path": data_path,
+              "backend": (f"explicit NC-P host-LLC model over {device_type.capitalize()} memory"
+                          if data_path == "ncp" else
+                          f"legacy TCP authoritative {device_type.capitalize()} memory"),
               "fault_injected": False}
     protocol = Protocol(Config(), INITIAL)
     server_process = guest_process = client = output = None
@@ -175,6 +182,8 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                 client = Client(("127.0.0.1", port), timeout=min(5.0, timeout))
             except OSError:
                 time.sleep(0.05)
+        if data_path == "ncp":
+            client.configure_ncp(ncp_sets, ncp_ways)
         control = struct.pack("<8Q", MAGIC, nonce, count, INITIAL[0], INITIAL[1], 2, 4, 1500)
         client.write(backend_address(0, device_type), control)
         client.write(backend_address(64, device_type), bytes(64))
@@ -307,13 +316,21 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                     data = bytes([data[0] ^ 0x80]) + data[1:]
                     corruption_done = True
                     result["fault_injected"] = True
-                client.write(backend_address(address, device_type), data)
+                target_address = backend_address(address, device_type)
+                if data_path == "ncp" and write.kind in ("payload", "ready"):
+                    client.ncp_write(target_address, data)
+                else:
+                    client.write(target_address, data)
                 protocol.complete(write.op_id)
             if mode == "early-ready" and first_target is not None and not result["fault_injected"]:
                 waiting = [w for w in protocol.pending.values() if w.token == first_target]
                 if len(waiting) == 1 and waiting[0].kind == "payload" and waiting[0].offset == 1472:
                     ready = backend_address(slot_address(first_target) + READY_OFFSET, device_type)
-                    client.write_u64(ready, first_target.generation)
+                    ready_data = struct.pack("<Q", first_target.generation)
+                    if data_path == "ncp":
+                        client.ncp_write(ready, ready_data)
+                    else:
+                        client.write(ready, ready_data)
                     result["fault_injected"] = True
             protocol.check_invariants()
             if guest_done:
@@ -335,6 +352,14 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
 
         result["producer_backend_reads"] = client.reads
         result["producer_backend_writes"] = client.writes
+        if data_path == "ncp":
+            ncp = client.query_ncp()
+            result["ncp"] = {**ncp, "configured_sets": ncp_sets,
+                             "configured_ways": ncp_ways}
+            if (ncp["pushes"] != client.ncp_writes
+                    or ncp["first_demands"] == 0
+                    or ncp["first_demand_hits"] > ncp["first_demands"]):
+                raise RuntimeError("NC-P completion or host first-demand evidence is inconsistent")
     except Exception as error:
         result.update(status="failed", error=repr(error))
         raise
@@ -378,16 +403,27 @@ def main(argv=None):
     parser.add_argument("--packets-per-flow", type=int, default=16)
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--device-type", choices=("type2", "type3"), default="type3")
+    parser.add_argument("--data-path", choices=("legacy", "ncp"), default="legacy")
+    parser.add_argument("--ncp-sets", type=int, default=64)
+    parser.add_argument("--ncp-ways", type=int, default=8)
     parser.add_argument("--case", choices=("all", "adversarial", "early-ready", "corrupt-payload"), default="all")
     args = parser.parse_args(argv)
     if args.packets_per_flow < 4 or args.timeout <= 0:
         parser.error("at least four packets per flow and a positive timeout are required")
+    if args.data_path == "ncp" and args.device_type != "type2":
+        parser.error("--data-path ncp requires --device-type type2")
+    if (args.ncp_sets <= 0 or args.ncp_ways <= 0 or args.ncp_sets > 65536
+            or args.ncp_ways > 64 or args.ncp_sets * args.ncp_ways > 1048576):
+        parser.error("NC-P host LLC dimensions are out of range")
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
     result = {"status": "running", "cases": [], "pins": PINS,
               "device_type": args.device_type,
+              "data_path": args.data_path,
               "scope": (f"RISC-V guest functional publication over {args.device_type.capitalize()} "
-                        "legacy TCP; no NC-P/LLC/ISA proof")}
+                        + ("explicit finite simulated host LLC; no physical LLC/ISA proof"
+                           if args.data_path == "ncp" else
+                           "legacy TCP; no NC-P/LLC/ISA proof"))}
     try:
         for name, revision in PINS.items():
             path = ROOT / "thirdparty" / name
@@ -409,7 +445,8 @@ def main(argv=None):
         for mode in cases:
             case = run_case(args.output / mode, args.qemu, args.server, args.guest,
                             ROOT / "thirdparty/cxlmemsim/qemu_integration/topology_simple.txt",
-                            mode, args.packets_per_flow, args.timeout, args.device_type)
+                            mode, args.packets_per_flow, args.timeout, args.device_type,
+                            args.data_path, args.ncp_sets, args.ncp_ways)
             result["cases"].append(case)
         result["status"] = "passed"
     except Exception as error:

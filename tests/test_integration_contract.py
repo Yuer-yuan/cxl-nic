@@ -6,7 +6,7 @@ import unittest
 
 from cxl_nic.checker import TraceViolation, validate_trace
 from cxl_nic.integration import (backend_address, pattern, qemu_command,
-                                 slot_address, write_address)
+                                 run_case, slot_address, write_address)
 from cxl_nic.model import Config, Protocol, ProtocolError, Token, Write
 
 
@@ -32,6 +32,13 @@ class GuestPatternTests(unittest.TestCase):
                              ("type2", 0), ("type2", 65536)):
             with self.subTest(device=device, port=port), self.assertRaises(ValueError):
                 qemu_command("qemu", "guest", device, port)
+
+    def test_ncp_data_path_requires_type2(self):
+        arguments = (None, None, None, None, None, "adversarial", 4, 1)
+        with self.assertRaisesRegex(ValueError, "data_path"):
+            run_case(*arguments, device_type="type2", data_path="unknown")
+        with self.assertRaisesRegex(ValueError, "Type2"):
+            run_case(*arguments, device_type="type3", data_path="ncp")
 
     def test_pattern_golden_vectors_cover_endianness_flow_and_partial_word(self):
         vectors = (
