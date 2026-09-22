@@ -131,6 +131,69 @@ throughput. Allocation and home conventions follow the
 and [CXL-NIC paper](https://saksham.web.illinois.edu/assets/pdf/cxl-nic.pdf);
 the model does not reproduce their hardware.
 
+## Reliable-reordering virtual time
+
+Run the deterministic policy matrix on Giga:
+
+```bash
+bash scripts/verify_timing.sh results/timing-run-001
+```
+
+The input workload contains complete packets with sender sequence numbers. Packets
+can be delayed and arrive out of order, but every serial eventually arrives exactly
+once. Permanent loss, retransmission, checksums, timeout recovery and congestion
+control are outside this stage. A temporary gap remains central to the experiment:
+it determines how long future packets wait before they are eligible for ordered
+delivery and cache injection.
+
+The matrix uses the same packet arrivals, payloads, cache, CPU service parameters
+and link parameters for every arm:
+
+- `A`: arrival-time DMA/DDIO; the CPU may read packets out of order into a software
+  reorder buffer, while application delivery remains in sender order.
+- `B0`: NIC reorder followed by an unrestricted contiguous DMA/DDIO burst.
+- `B1`: NIC reorder followed by credit-limited delayed DMA/DDIO.
+- `C`: arrival-time NC-P hypothesis, with ordered publication to the CPU.
+- `D0`: NIC reorder followed by an unrestricted contiguous NC-P burst.
+- `D1`: NIC reorder followed by credit-limited delayed NC-P.
+- `E`: NIC reorder and ordered publication without payload push; CPU demand fetches
+  from NIC memory.
+- `D1-host-control`: the D1 scheduler with host backing, used only to prove that a
+  protocol label does not change a matched B1 result.
+
+All times are integer virtual nanoseconds. The engine models a serialized 64-byte
+link, propagation latency, a single CPU consumer, per-flow push credit, finite NIC
+buffering, a finite CPU software reorder buffer for arm A, the shared LLC, optional
+periodic background references and optional post-push NC-write withdrawal. A
+NIC-home CPU miss consumes return-link bandwidth and waits behind queued producer
+traffic. Host and NIC backing service times are separate parameters.
+
+The verification script runs the full matrix plus gap-delay, LLC pressure, I/O way
+admission, NC-write withdrawal, tight-credit and packet-stride cases. Packet stride
+is expressed in cache lines; 128 and 129 line strides expose sensitivity to the
+model's simple modulo set mapping. It records ordered-delivery p50/p99 latency,
+first payload-line hit rate, push-to-demand distance, premature absence, credit
+stalls, NIC/CPU buffer occupancy and producer/CPU link bytes. B1 and the host-backed
+D1 control must be exactly equal whenever their admission and withdrawal policies
+match.
+
+The default numeric parameters are deliberately uncalibrated. Cache writeback bytes
+are counted by backing home, but their queueing time is not yet fed back into virtual
+time. The model also excludes CPU private caches, prefetching, interrupts, failed
+polls, hardware LLC hashing/replacement and actual PCIe/CXL transaction channels.
+Therefore its output supports mechanism and sensitivity claims under the recorded
+configuration, not nanosecond hardware-performance claims.
+
+Run one custom matrix with:
+
+```bash
+python3 -m cxl_nic.timing --output results/timing-custom-001 \
+    --packets-per-flow 64 --gap-delay-ns 800 \
+    --push-credit-bytes-per-flow 3072 \
+    --background-interval-ns 20 --background-working-set-lines 1024 \
+    --ddio-ways 0,1 --ncp-ways all
+```
+
 ## Scope
 
 The model uses one fixed session, sender-provided packet sequence numbers and
