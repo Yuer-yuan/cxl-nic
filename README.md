@@ -80,16 +80,23 @@ python3 -m cxl_nic.integration --device-type type2 --data-path ddio \
     --llc-owner qemu --output results/integration-qemu-ddio-001
 ```
 
-In this mode, the Python producer sends writes to the Type2 model's localhost
-ingress. QEMU completes NC-P only after installing the line in its shared host
-cache model. The guest reads Type2 device memory through a committed HDM decoder
-and QEMU's CXL fixed memory window. A host-cache miss fetches from CXLMemSim
-NIC backing through the Type2 CXL.mem request path. Dirty NC-P evictions write
-back to NIC backing; modeled DDIO first updates host backing and installs a
-clean line. The run checks that CXLMemSim's older LLC model sees no host
-demands or pushes. The localhost ingress represents NIC commands rather than
-encoded CXL.cache packets, and the QEMU cache remains a functional host-cache
-model rather than a physical CPU cache or CXL.cache timing validation.
+In this mode, the Python producer sends NIC requests to the Type2 model's
+localhost DCOH ingress. For each NC-P, QEMU models a non-posted CXL.cache D2H
+Write transaction: DCOH line staging, D2H request, H2D WritePull, 64-byte D2H
+data, H2D GO-I, and device-line invalidation. The NIC receives completion only
+after host-cache installation. The guest reads Type2 device memory through a
+committed HDM decoder and QEMU's CXL fixed memory window. A host-cache miss
+models a CXL.mem MemRd, device-cache miss and MemData/completion; dirty NC-P
+eviction models a CXL.mem writeback to NIC backing. Modeled DDIO updates host
+backing and installs a clean line without CXL.cache push messages. The run
+checks message counts, completion, data, and backing traffic, and confirms
+CXLMemSim's older LLC model sees no host demands or pushes. NC-P is a DCOH
+hint, so this model does not assert a specific Agilex CXL.cache opcode mapping.
+For host-bias NC-write, it models WOWrInv/F, host invalidation and CXL.mem
+MemWrFwd before the NIC-memory update.
+
+It does not model link encoding, credits, concurrent in-flight transactions,
+calibrated latency, or a physical CPU cache.
 
 Run the Type2 gate sensitivity sweep on Giga:
 

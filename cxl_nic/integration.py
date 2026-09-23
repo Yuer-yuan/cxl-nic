@@ -1,8 +1,8 @@
 """RISC-V guest publication checks over pinned QEMU and CXLMemSim endpoints.
 
-Type2 guest loads use an HDM fixed window. NC-P can use either CXLMemSim's
-older cache model or QEMU's host-side cache model; neither represents a
-physical CPU cache or CXL.cache link timing.
+Type2 guest loads use an HDM fixed window. QEMU models the NC-P DCOH request,
+CXL.cache write transaction sequence, host cache and CXL.mem miss/writeback
+flows. It does not model a physical CPU cache or CXL link timing.
 """
 
 import argparse
@@ -38,7 +38,7 @@ RELEASE_OFFSET = 128
 TYPE2_DPA_BASE = 0x200000
 INITIAL = {0: 254, 1: 510}
 FIELDS = ("flow", "serial", "slot", "generation", "length")
-PINS = {"qemu": "09f89ac5d7bdfa1d08ac2104fa129ab293194dbc",
+PINS = {"qemu": "c86e85e57e3d449bf08982a17a5a952716fa0857",
         "cxlmemsim": "b5e183ea9732fa023c5df1a749a857430c3a237b"}
 
 
@@ -546,6 +546,28 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                 if (server_cache["pushes"] or server_cache["host_reads"]
                         or server_cache["first_demands"]):
                     raise RuntimeError("QEMU cache run also used the CXLMemSim LLC model")
+                cache_protocol = producer.query_cxl_cache_protocol()
+                mem_protocol = producer.query_cxl_mem_protocol()
+                result["cxl_cache_protocol"] = cache_protocol
+                result["cxl_mem_protocol"] = mem_protocol
+                expected_pushes = completed if data_path == "ncp" else 0
+                if (any(cache_protocol[key] != expected_pushes for key in
+                        ("dcoh_staged", "d2h_write_requests", "h2d_write_pulls",
+                         "h2d_go_i", "dcoh_invalidations"))
+                        or cache_protocol["d2h_data_bytes"] != expected_pushes * 64
+                        or cache_protocol["nc_d2h_write_requests"] !=
+                        producer.ncp_nc_writes
+                        or cache_protocol["nc_memwr_fwd"] != producer.ncp_nc_writes):
+                    raise RuntimeError("DCOH/CXL.cache push transaction did not complete")
+                if (mem_protocol["m2s_reads"] != mem_protocol["s2m_read_completions"]
+                        or mem_protocol["s2m_read_data_bytes"] !=
+                        mem_protocol["m2s_reads"] * 64
+                        or mem_protocol["dcoh_read_misses"] != mem_protocol["m2s_reads"]
+                        or mem_protocol["m2s_writes"] !=
+                        mem_protocol["s2m_write_completions"]
+                        or mem_protocol["dirty_writeback_bytes"] !=
+                        cache["dirty_writeback_bytes"]["nic"]):
+                    raise RuntimeError("CXL.mem miss or writeback transaction is inconsistent")
             if (cache["pushes"] != completed
                     or cache["first_demands"] == 0
                     or cache["first_demand_hits"] > cache["first_demands"]):
@@ -683,8 +705,8 @@ def main(argv=None):
               "global_push_credit_bytes": args.global_push_credit_bytes,
               "scope": (f"RISC-V guest functional publication over {args.device_type.capitalize()} "
                         + (f"finite {args.llc_owner} host-cache model; "
-                           "Type2 HDM CXL.mem request path, no physical LLC or "
-                           "CXL.cache link timing proof"
+                           "Type2 HDM CXL.mem path, QEMU transaction sequence "
+                           "when selected; no physical LLC or CXL link timing proof"
                            if args.data_path != "legacy" else
                            "legacy TCP; no NC-P/LLC/ISA proof"))}
     try:

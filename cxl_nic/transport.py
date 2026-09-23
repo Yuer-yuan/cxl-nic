@@ -17,6 +17,8 @@ OP_DDIO_QUERY = 24
 OP_HOST_LLC_TRAFFIC_QUERY = 25
 OP_NCP_NC_WRITE = 26
 OP_NCP_DEMAND_RANGE_QUERY = 27
+OP_CXL_CACHE_PROTOCOL_QUERY = 28
+OP_CXL_MEM_PROTOCOL_QUERY = 29
 
 
 class TransportError(RuntimeError):
@@ -181,3 +183,17 @@ class Client:
             self.close()
             raise TransportError("server returned inconsistent host LLC backing traffic")
         return result
+
+    def query_cxl_cache_protocol(self):
+        _, _, data = self._exchange(OP_CXL_CACHE_PROTOCOL_QUERY)
+        return dict(zip(("dcoh_staged", "d2h_write_requests", "h2d_write_pulls",
+                         "d2h_data_bytes", "h2d_go_i", "dcoh_invalidations",
+                         "nc_d2h_write_requests", "nc_memwr_fwd"),
+                        struct.unpack("<8Q", data)))
+
+    def query_cxl_mem_protocol(self):
+        _, _, data = self._exchange(OP_CXL_MEM_PROTOCOL_QUERY)
+        return dict(zip(("m2s_reads", "s2m_read_data_bytes", "s2m_read_completions",
+                         "m2s_writes", "m2s_write_data_bytes",
+                         "s2m_write_completions", "dirty_writeback_bytes",
+                         "dcoh_read_misses"), struct.unpack("<8Q", data)))
