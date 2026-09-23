@@ -65,6 +65,9 @@ python3 -m cxl_nic.integration --device-type type2 --data-path ncp \
 python3 -m cxl_nic.integration --device-type type2 --data-path ddio \
     --host-llc-sets 64 --host-llc-ways 8 --output results/integration-ddio-001
 bash scripts/verify_integration_cache.sh results/integration-cache-matrix-001
+python3 -m cxl_nic.integration --device-type type2 --data-path ncp \
+    --case adversarial --global-push-credit-bytes 3072 \
+    --output results/integration-global-budget-001
 ```
 
 In NC-P mode, QEMU registers its Type2 connection as the host requester and
@@ -97,6 +100,9 @@ The residency gate is an executable version of the paper's runtime push/write
 choice. It proves that both operations can safely coexist with ordered publication
 and exposes the resulting NIC-backing fallback. The threshold is a sensitivity
 parameter rather than a calibrated hardware occupancy signal.
+The optional global push budget bounds aggregate unconsumed payload reservations
+across flows. This adversarial integration schedule holds one maximum-size packet
+while another flow makes progress, so it requires at least 3072 bytes of budget.
 
 For an injected line that misses at first CPU demand, the server attributes the
 64-byte backing fill to NIC memory for NC-P and host memory for DDIO. It also
@@ -195,14 +201,15 @@ bash scripts/verify_timing_sweep.sh results/timing-sweep-001
 ```
 
 The sweep holds 64 packets per case and varies one experimental axis: NC-P gate
-threshold, normalized LLC capacity, CPU base service, fixed packet size, or flow
-count. It also sweeps link bandwidth at 100 Gbps, the paper-derived 184 Gbps
+threshold, normalized LLC capacity, CPU base service, fixed packet size, flow
+count, global push budget, or host flag sampling interval. It also sweeps link bandwidth at 100 Gbps, the paper-derived 184 Gbps
 NC-P/NC-write point, and its 204 Gbps theoretical limit; unreported link and NIC
 miss latencies remain explicit sensitivity axes. Every case runs B1, D1, D1-gated
 and D1-host-control on the same workload.
 The paper reports the 400 MHz, one-64-byte-request-per-cycle throughput anchor and
 roughly 90% utilization for NC-P/NC-write, but does not report its adaptive LLC
-threshold or post-push delay `N`; neither value is treated as calibrated here.
+threshold, host flag sampling interval, control-write latency, or post-push delay
+`N`; none of these values is treated as calibrated here.
 It reports payload and background hit rates, background misses per virtual
 microsecond, backing and link traffic, buffer/credit pressure and p50/p99 ordered
 delivery latency. These are sensitivity results rather than hardware predictions.
@@ -232,12 +239,14 @@ and link parameters for every arm:
   protocol label does not change a matched B1 result.
 
 All times are integer virtual nanoseconds. The engine models a serialized 64-byte
-link, propagation latency, a single CPU consumer, per-flow push credit, finite NIC
+link, propagation latency, a single CPU consumer, per-flow push credit, optional
+global push credit, finite NIC
 buffering, a finite CPU software reorder buffer for arm A, the shared LLC, optional
 periodic background references, optional post-push NC-write withdrawal, and an
-adaptive NC-P/NC-write gate. The gate samples whole-cache occupancy when each
-payload line becomes visible; its threshold is a sensitivity parameter rather
-than a calibrated hardware signal. A
+adaptive NC-P/NC-write gate. The default gate reads modeled whole-cache occupancy
+when each payload line becomes visible. Optional periodic sampling holds a host
+flag between samples and applies changed flags after a configured control latency.
+These parameters are sensitivities rather than calibrated hardware signals. A
 NIC-home CPU miss consumes return-link bandwidth and waits behind queued producer
 traffic. Host and NIC backing service times are separate parameters.
 
@@ -265,7 +274,8 @@ Run one custom matrix with:
 ```bash
 python3 -m cxl_nic.timing --output results/timing-custom-001 \
     --packets-per-flow 64 --gap-delay-ns 800 \
-    --push-credit-bytes-per-flow 3072 \
+    --push-credit-bytes-per-flow 3072 --global-push-credit-bytes 3072 \
+    --ncp-gate-sample-interval-ns 200 --ncp-gate-control-latency-ns 100 \
     --background-interval-ns 20 --background-working-set-lines 1024 \
     --ddio-ways 0,1 --ncp-ways all
 ```
@@ -273,7 +283,8 @@ python3 -m cxl_nic.timing --output results/timing-custom-001 \
 ## Scope
 
 The model uses one fixed session, sender-provided packet sequence numbers and
-explicit epochs, complete packets, per-flow delivery and reserved per-flow credits.
+explicit epochs, complete packets, per-flow delivery, reserved per-flow credits,
+and an optional aggregate reservation across flows.
 The NIC reorder stage, rather than either cache-injection operation, enforces packet
 order and publishes only a contiguous per-flow prefix. The current scope assumes
 reliable eventual delivery of every complete packet with finite reordering; loss

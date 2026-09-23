@@ -114,12 +114,15 @@ class TimingConfig:
     host_miss_ns: int = 90
     nic_miss_ns: int = 250
     push_credit_bytes_per_flow: int = 3072
+    global_push_credit_bytes: int | None = None
     nic_buffer_bytes: int = 8 << 20
     cpu_reorder_buffer_bytes: int = 8 << 20
     background_interval_ns: int | None = None
     background_working_set_lines: int = 0
     ncp_withdraw_ns: int | None = None
     ncp_gate_resident_lines: int = 32
+    ncp_gate_sample_interval_ns: int | None = None
+    ncp_gate_control_latency_ns: int = 0
     max_time_ns: int = 10_000_000
 
     def __post_init__(self):
@@ -136,6 +139,19 @@ class TimingConfig:
                 raise TimingError(f"{name} must be a nonnegative integer or None")
         if self.background_interval_ns == 0:
             raise TimingError("background_interval_ns must be positive when enabled")
+        if (self.global_push_credit_bytes is not None
+                and (type(self.global_push_credit_bytes) is not int
+                     or self.global_push_credit_bytes <= 0)):
+            raise TimingError("global_push_credit_bytes must be a positive integer or None")
+        if (self.ncp_gate_sample_interval_ns is not None
+                and (type(self.ncp_gate_sample_interval_ns) is not int
+                     or self.ncp_gate_sample_interval_ns <= 0)):
+            raise TimingError("ncp_gate_sample_interval_ns must be a positive integer or None")
+        if (type(self.ncp_gate_control_latency_ns) is not int
+                or self.ncp_gate_control_latency_ns < 0):
+            raise TimingError("ncp_gate_control_latency_ns must be a nonnegative integer")
+        if self.ncp_gate_sample_interval_ns is None and self.ncp_gate_control_latency_ns:
+            raise TimingError("gate control latency requires periodic sampling")
         if self.packet_stride_lines * LINE_BYTES < PAYLOAD_OFFSET + 1500:
             raise TimingError("packet_stride_lines cannot fit metadata and a 1500-byte packet")
         if type(self.background_working_set_lines) is not int or self.background_working_set_lines < 0:
@@ -275,6 +291,10 @@ class Simulation:
         self.admission = config.admission(policy.family)
         self.cache = Cache(config.cache_sets, config.cache_ways)
         self.flows = sorted(self.initial)
+        if (policy.use_credit and config.global_push_credit_bytes is not None
+                and config.global_push_credit_bytes < max(
+                    aligned_size(len(packet.payload)) for packet in self.packets)):
+            raise TimingError("global push credit cannot fit a workload packet")
         self.states = {}
         self.by_index = {}
         for index, packet in enumerate(sorted(self.packets, key=lambda item: (item.flow, item.serial))):
@@ -310,6 +330,12 @@ class Simulation:
         self.credit_stall_start = dict.fromkeys(self.flows, None)
         self.credit_stall_ns = dict.fromkeys(self.flows, 0)
         self.credit_stall_events = dict.fromkeys(self.flows, 0)
+        self.global_credit = 0
+        self.global_credit_peak = 0
+        self.global_stall_start = dict.fromkeys(self.flows, None)
+        self.global_stall_ns = dict.fromkeys(self.flows, 0)
+        self.global_stall_events = dict.fromkeys(self.flows, 0)
+        self.issue_round_robin = 0
         self.nic_buffer = 0
         self.nic_buffer_peak = 0
         self.cpu_reorder_buffer = 0
@@ -325,12 +351,19 @@ class Simulation:
         self.withdrawals_stale = 0
         self.gated_ncp_lines = 0
         self.gated_nc_write_lines = 0
+        self.gate_push_enabled = True
+        self.gate_requested = True
+        self.gate_samples = 0
+        self.gate_control_writes = 0
+        self.gate_control_applies = 0
         self.delivered = []
         self.demand_records = []
         for state in self.states.values():
             self._schedule(state.packet.arrival_ns, "arrival", state.index)
         if config.background_interval_ns is not None:
             self._schedule(0, "background")
+        if policy.adaptive_ncp_gate and config.ncp_gate_sample_interval_ns is not None:
+            self._schedule(0, "gate_sample")
 
     def _schedule(self, time_ns, kind, *arguments):
         self._event_id += 1
@@ -383,11 +416,16 @@ class Simulation:
         if self.policy.use_credit:
             flow = state.packet.flow
             self.credit[flow] += state.charge
+            self.global_credit += state.charge
+            self.global_credit_peak = max(self.global_credit_peak, self.global_credit)
             self.credit_peak[flow] = max(self.credit_peak[flow], self.credit[flow])
             state.credit_reserved = True
             if self.credit_stall_start[flow] is not None:
                 self.credit_stall_ns[flow] += now - self.credit_stall_start[flow]
                 self.credit_stall_start[flow] = None
+            if self.global_stall_start[flow] is not None:
+                self.global_stall_ns[flow] += now - self.global_stall_start[flow]
+                self.global_stall_start[flow] = None
         self._record(now, "issue", policy=self.policy.name, flow=state.packet.flow,
                      serial=state.packet.serial, sequence_wait_ns=now - state.packet.arrival_ns)
         if not self.policy.push_payload:
@@ -404,6 +442,9 @@ class Simulation:
     def _try_issue(self, flow, now):
         if not self.policy.reorder_before_push:
             return
+        if self.config.global_push_credit_bytes is not None and self.policy.use_credit:
+            self._try_issue_global(now)
+            return
         while True:
             state = self.states.get((flow, self.next_issue[flow]))
             if state is None or not state.arrived:
@@ -415,6 +456,34 @@ class Simulation:
                 return
             self.next_issue[flow] += 1
             self._issue(state, now)
+
+    def _try_issue_global(self, now):
+        """Rotate one packet at a time across flows sharing push reservations."""
+        while True:
+            progressed = False
+            for offset in range(len(self.flows)):
+                index = (self.issue_round_robin + offset) % len(self.flows)
+                flow = self.flows[index]
+                state = self.states.get((flow, self.next_issue[flow]))
+                if state is None or not state.arrived:
+                    continue
+                if self.credit[flow] + state.charge > self.config.push_credit_bytes_per_flow:
+                    if self.credit_stall_start[flow] is None:
+                        self.credit_stall_start[flow] = now
+                        self.credit_stall_events[flow] += 1
+                    continue
+                if self.global_credit + state.charge > self.config.global_push_credit_bytes:
+                    if self.global_stall_start[flow] is None:
+                        self.global_stall_start[flow] = now
+                        self.global_stall_events[flow] += 1
+                    continue
+                self.next_issue[flow] += 1
+                self._issue(state, now)
+                self.issue_round_robin = (index + 1) % len(self.flows)
+                progressed = True
+                break
+            if not progressed:
+                return
 
     def _try_publish(self, flow, now, candidate=None):
         state = candidate if self.policy.cpu_reorder else self.states.get((flow, self.next_publish[flow]))
@@ -465,8 +534,9 @@ class Simulation:
     def _payload_visible(self, now, state, offset, data):
         address = state.base + PAYLOAD_OFFSET + offset
         placement = self.policy.family
-        if (self.policy.adaptive_ncp_gate
-                and self.cache.resident_lines() >= self.config.ncp_gate_resident_lines):
+        gate_enabled = (self.gate_push_enabled if self.config.ncp_gate_sample_interval_ns is not None
+                        else self.cache.resident_lines() < self.config.ncp_gate_resident_lines)
+        if self.policy.adaptive_ncp_gate and not gate_enabled:
             self.cache.bypass_write(address, data)
             self.gated_nc_write_lines += 1
             placement = "nc_write"
@@ -532,6 +602,25 @@ class Simulation:
         next_time = now + self.config.background_interval_ns
         if next_time <= self.config.max_time_ns:
             self._schedule(next_time, "background")
+
+    def _gate_sample(self, now):
+        self.gate_samples += 1
+        enabled = self.cache.resident_lines() < self.config.ncp_gate_resident_lines
+        self._record(now, "gate_sample", resident_lines=self.cache.resident_lines(),
+                     requested_push=enabled)
+        if enabled != self.gate_requested:
+            self.gate_requested = enabled
+            self.gate_control_writes += 1
+            self._schedule(now + self.config.ncp_gate_control_latency_ns,
+                           "gate_apply", enabled)
+        next_time = now + self.config.ncp_gate_sample_interval_ns
+        if next_time <= self.config.max_time_ns:
+            self._schedule(next_time, "gate_sample")
+
+    def _gate_apply(self, now, enabled):
+        self.gate_push_enabled = enabled
+        self.gate_control_applies += 1
+        self._record(now, "gate_apply", push_enabled=enabled)
 
     def _cpu_consume(self, now, state):
         packet = state.packet
@@ -602,6 +691,7 @@ class Simulation:
         state.consuming = False
         if state.credit_reserved:
             self.credit[packet.flow] -= state.charge
+            self.global_credit -= state.charge
         self.nic_buffer -= state.charge
         self.cpu_scheduled = False
         self._record(now, "buffer_release", flow=packet.flow, serial=packet.serial)
@@ -634,7 +724,8 @@ class Simulation:
             now, _, kind, arguments = heapq.heappop(self.events)
             if now > self.config.max_time_ns:
                 raise TimingError("virtual-time deadline expired")
-            state = self.by_index[arguments[0]] if arguments and kind != "background" else None
+            state = self.by_index[arguments[0]] if arguments and kind not in (
+                "background", "gate_apply") else None
             if kind == "arrival":
                 self._arrival(now, state)
             elif kind == "payload_visible":
@@ -647,6 +738,10 @@ class Simulation:
                 self._withdraw(now, state, arguments[1], arguments[2])
             elif kind == "background":
                 self._background(now)
+            elif kind == "gate_sample":
+                self._gate_sample(now)
+            elif kind == "gate_apply":
+                self._gate_apply(now, arguments[0])
             elif kind == "cpu_consume":
                 self._cpu_consume(now, state)
             elif kind == "release":
@@ -658,7 +753,8 @@ class Simulation:
             actual = [serial for delivered_flow, serial, _ in self.delivered if delivered_flow == flow]
             if actual != expected:
                 raise TimingError("delivery order differs from sender sequence")
-        if self.nic_buffer != 0 or self.cpu_reorder_buffer != 0 or any(self.credit.values()):
+        if (self.nic_buffer != 0 or self.cpu_reorder_buffer != 0
+                or any(self.credit.values()) or self.global_credit != 0):
             raise TimingError("buffer or credit leaked after completion")
         latencies = [state.delivery_ns - state.packet.arrival_ns for state in self.states.values()]
         sequence_waits = [state.issue_ns - state.packet.arrival_ns for state in self.states.values()]
@@ -699,6 +795,10 @@ class Simulation:
         if self.policy.use_credit and any(
                 value > self.config.push_credit_bytes_per_flow for value in self.credit_peak.values()):
             raise TimingError("push credit exceeded its configured bound")
+        if (self.global_credit_peak != max(self.global_credit_peak, 0)
+                or (self.config.global_push_credit_bytes is not None
+                    and self.global_credit_peak > self.config.global_push_credit_bytes)):
+            raise TimingError("global push credit exceeded its configured bound")
         for state in self.states.values():
             times = (state.packet.arrival_ns, state.issue_ns, state.ready_ns,
                      state.consume_ns, state.processing_done_ns, state.delivery_ns)
@@ -746,12 +846,23 @@ class Simulation:
                               "ncp_lines": self.gated_ncp_lines,
                               "nc_write_lines": self.gated_nc_write_lines,
                               "nc_write_bytes": self.gated_nc_write_lines * LINE_BYTES},
+            "gate_sampling": {"interval_ns": (self.config.ncp_gate_sample_interval_ns
+                                               if self.policy.adaptive_ncp_gate else None),
+                              "control_latency_ns": (self.config.ncp_gate_control_latency_ns
+                                                     if self.policy.adaptive_ncp_gate else None),
+                              "samples": self.gate_samples,
+                              "control_writes": self.gate_control_writes,
+                              "control_applies": self.gate_control_applies,
+                              "pending_control_writes": self.gate_control_writes - self.gate_control_applies},
             "link_busy_until_ns": _ns_ceil(self.link_available_ps),
             "nic_buffer_peak_bytes": self.nic_buffer_peak,
             "cpu_reorder_buffer_peak_bytes": self.cpu_reorder_buffer_peak,
             "credit_peak_bytes": {str(flow): value for flow, value in self.credit_peak.items()},
             "credit_stall_events": {str(flow): value for flow, value in self.credit_stall_events.items()},
             "credit_stall_ns": {str(flow): value for flow, value in self.credit_stall_ns.items()},
+            "global_credit_peak_bytes": self.global_credit_peak,
+            "global_stall_events": {str(flow): value for flow, value in self.global_stall_events.items()},
+            "global_stall_ns": {str(flow): value for flow, value in self.global_stall_ns.items()},
             "withdrawn_payload_lines": self.withdrawals,
             "withdrawal_timing": {"scheduled_lines": self.withdrawals_scheduled,
                                   "before_first_demand_lines": self.withdrawals_before_demand,
@@ -780,9 +891,11 @@ def _comparable(result):
         "admitted_absent_at_first_demand", "link_bytes",
         "producer_link_bytes", "cpu_nic_read_bytes", "payload_push_bytes",
         "adaptive_gate",
+        "gate_sampling",
         "link_busy_until_ns", "nic_buffer_peak_bytes",
         "cpu_reorder_buffer_peak_bytes",
         "credit_peak_bytes", "credit_stall_events", "credit_stall_ns",
+        "global_credit_peak_bytes", "global_stall_events", "global_stall_ns",
         "withdrawn_payload_lines", "withdrawal_timing", "delivery_order", "packet_records",
         "cache_before_final_flush", "cache_after_final_flush")}
 
@@ -852,12 +965,15 @@ def main(argv=None):
     parser.add_argument("--nic-miss-ns", type=int, default=250,
                         help="symbolic NIC backing service, in addition to link queue/latency")
     parser.add_argument("--push-credit-bytes-per-flow", type=int, default=3072)
+    parser.add_argument("--global-push-credit-bytes", type=int)
     parser.add_argument("--nic-buffer-bytes", type=int, default=8 << 20)
     parser.add_argument("--cpu-reorder-buffer-bytes", type=int, default=8 << 20)
     parser.add_argument("--background-interval-ns", type=int)
     parser.add_argument("--background-working-set-lines", type=int, default=0)
     parser.add_argument("--ncp-withdraw-ns", type=int)
     parser.add_argument("--ncp-gate-resident-lines", type=int, default=32)
+    parser.add_argument("--ncp-gate-sample-interval-ns", type=int)
+    parser.add_argument("--ncp-gate-control-latency-ns", type=int, default=0)
     parser.add_argument("--max-time-ns", type=int, default=10_000_000)
     parser.add_argument("--policies", default=",".join(POLICIES),
                         help="comma-separated A,B0,B1,C,D0,D1,D1-gated,E,D1-host-control")
@@ -875,12 +991,15 @@ def main(argv=None):
                           cpu_base_ns=args.cpu_base_ns, llc_hit_ns=args.llc_hit_ns,
                           host_miss_ns=args.host_miss_ns, nic_miss_ns=args.nic_miss_ns,
                           push_credit_bytes_per_flow=args.push_credit_bytes_per_flow,
+                          global_push_credit_bytes=args.global_push_credit_bytes,
                           nic_buffer_bytes=args.nic_buffer_bytes,
                           cpu_reorder_buffer_bytes=args.cpu_reorder_buffer_bytes,
                           background_interval_ns=args.background_interval_ns,
                           background_working_set_lines=args.background_working_set_lines,
                           ncp_withdraw_ns=args.ncp_withdraw_ns,
                           ncp_gate_resident_lines=args.ncp_gate_resident_lines,
+                          ncp_gate_sample_interval_ns=args.ncp_gate_sample_interval_ns,
+                          ncp_gate_control_latency_ns=args.ncp_gate_control_latency_ns,
                           max_time_ns=args.max_time_ns)
     args.output.mkdir(parents=True, exist_ok=False)
     workload = [{"flow": packet.flow, "serial": packet.serial,

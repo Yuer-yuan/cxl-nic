@@ -22,6 +22,8 @@ PAPER_ANCHORS = {
     "host_llc_mib": 60,
     "host_cpu_ghz": 2.2,
     "adaptive_gate_threshold_reported": False,
+    "host_flag_sampling_interval_reported": False,
+    "host_flag_control_latency_reported": False,
     "post_push_delay_cycles_reported": False,
 }
 BASE_CONFIG = TimingConfig(background_interval_ns=20,
@@ -80,6 +82,19 @@ CASES = (
     SweepCase("flows-02", "flows", 2),
     SweepCase("flows-04", "flows", 4, flows=4, packets_per_flow=16),
     SweepCase("flows-08", "flows", 8, flows=8, packets_per_flow=8),
+    SweepCase("global-1536", "global_push_credit_bytes", 1536,
+              config_changes=(("global_push_credit_bytes", 1536),)),
+    SweepCase("global-3072", "global_push_credit_bytes", 3072,
+              config_changes=(("global_push_credit_bytes", 3072),)),
+    SweepCase("sample-0020", "ncp_gate_sample_interval_ns", 20,
+              config_changes=(("ncp_gate_sample_interval_ns", 20),
+                              ("ncp_gate_control_latency_ns", 100))),
+    SweepCase("sample-0200", "ncp_gate_sample_interval_ns", 200,
+              config_changes=(("ncp_gate_sample_interval_ns", 200),
+                              ("ncp_gate_control_latency_ns", 100))),
+    SweepCase("sample-1600", "ncp_gate_sample_interval_ns", 1600,
+              config_changes=(("ncp_gate_sample_interval_ns", 1600),
+                              ("ncp_gate_control_latency_ns", 100))),
     SweepCase("bandwidth-100", "link_bandwidth_gbps", 100),
     SweepCase("bandwidth-184", "link_bandwidth_gbps", 184,
               config_changes=(("link_bandwidth_gbps", 184),)),
@@ -114,7 +129,8 @@ def validate_cases(cases=CASES):
                 raise ValueError(f"{case.name}: capacity sweep must retain 1/4 background and 3/4 gate")
         if case.axis == "gate_threshold_lines" and config.ncp_gate_resident_lines != case.value:
             raise ValueError(f"{case.name}: gate threshold does not match its axis value")
-        if case.axis in ("link_bandwidth_gbps", "link_latency_ns", "nic_miss_ns"):
+        if case.axis in ("link_bandwidth_gbps", "link_latency_ns", "nic_miss_ns",
+                         "global_push_credit_bytes", "ncp_gate_sample_interval_ns"):
             if getattr(config, case.axis) != case.value:
                 raise ValueError(f"{case.name}: timing parameter does not match its axis value")
     return tuple(cases)
@@ -137,6 +153,9 @@ def _validate_result(case, result):
             raise ValueError(f"{case.name}/{name}: background denominator is inconsistent")
         if arm["link_bytes"] != arm["producer_link_bytes"] + arm["cpu_nic_read_bytes"]:
             raise ValueError(f"{case.name}/{name}: link traffic is inconsistent")
+        if (case.config().global_push_credit_bytes is not None
+                and arm["global_credit_peak_bytes"] > case.config().global_push_credit_bytes):
+            raise ValueError(f"{case.name}/{name}: global push budget exceeded")
         gate = arm["adaptive_gate"]
         decisions = gate["ncp_lines"] + gate["nc_write_lines"]
         if name == "D1-gated":
@@ -144,6 +163,11 @@ def _validate_result(case, result):
                     or gate["threshold_resident_lines"] != case.config().ncp_gate_resident_lines
                     or gate["nc_write_bytes"] != gate["nc_write_lines"] * 64):
                 raise ValueError(f"{case.name}: adaptive gate accounting is inconsistent")
+            sample = arm["gate_sampling"]
+            if (case.config().ncp_gate_sample_interval_ns is not None
+                    and (sample["samples"] == 0
+                         or sample["control_writes"] < sample["control_applies"])):
+                raise ValueError(f"{case.name}: sampled gate accounting is inconsistent")
         elif decisions or gate["nc_write_bytes"]:
             raise ValueError(f"{case.name}/{name}: non-gated arm recorded gate decisions")
 
@@ -162,7 +186,10 @@ def _short(arm):
         "cpu_nic_read_bytes": arm["cpu_nic_read_bytes"],
         "nic_buffer_peak_bytes": arm["nic_buffer_peak_bytes"],
         "credit_stall_ns": sum(arm["credit_stall_ns"].values()),
+        "global_credit_peak_bytes": arm["global_credit_peak_bytes"],
+        "global_stall_ns": sum(arm["global_stall_ns"].values()),
         "adaptive_gate": arm["adaptive_gate"],
+        "gate_sampling": arm["gate_sampling"],
         "backing_traffic_bytes": arm["backing_traffic_bytes"],
     }
 
@@ -181,7 +208,7 @@ def _validate_cross_cases(results):
     last_gated = gated[-1]
     if last_gated["adaptive_gate"]["nc_write_lines"] != 0:
         raise ValueError("above-capacity endpoint did not choose NC-P for every line")
-    for key in set(last_d1) - {"adaptive_gate"}:
+    for key in set(last_d1) - {"adaptive_gate", "gate_sampling"}:
         if last_d1[key] != last_gated[key]:
             raise ValueError(f"above-capacity gate changed D1 behavior: {key}")
 
@@ -224,6 +251,7 @@ def run_sweep(output, cases=CASES):
             "CXL one-way request latency",
             "host-memory and NIC-memory miss service",
             "adaptive gate threshold",
+            "host flag sampling interval and control latency",
             "post-push delay cycles",
             "physical LLC indexing and replacement"],
         "checks": {"matched_label_control": "passed",

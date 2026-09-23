@@ -57,6 +57,15 @@ class WorkloadTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(TimingError):
                 config(**changes)
 
+        for changes in ({"global_push_credit_bytes": 0},
+                        {"global_push_credit_bytes": True},
+                        {"ncp_gate_sample_interval_ns": 0},
+                        {"ncp_gate_sample_interval_ns": True},
+                        {"ncp_gate_control_latency_ns": -1},
+                        {"ncp_gate_control_latency_ns": 1}):
+            with self.subTest(changes=changes), self.assertRaises(TimingError):
+                config(**changes)
+
 
 class TimingPolicyTests(unittest.TestCase):
     def test_default_packet_bases_do_not_all_alias_one_modulo_cache_set(self):
@@ -126,6 +135,44 @@ class TimingPolicyTests(unittest.TestCase):
         issues = [item["issue_ns"] for item in result["packet_records"]]
         self.assertEqual(issues, sorted(issues))
         self.assertEqual(len(set(issues)), 4)
+
+    def test_global_budget_rotates_across_flows_and_preserves_matched_control(self):
+        workload = tuple(packet(serial, 0, flow=flow)
+                         for flow in range(4) for serial in range(2))
+        cfg = config(global_push_credit_bytes=128)
+        result = run_matrix(workload, cfg, ("B1", "D1", "D1-host-control"))
+        self.assertEqual(result["fairness_control"], "passed")
+        for arm in result["arms"].values():
+            self.assertEqual(arm["global_credit_peak_bytes"], 128)
+            self.assertGreater(sum(arm["global_stall_events"].values()), 0)
+            self.assertGreater(sum(arm["global_stall_ns"].values()), 0)
+            self.assertEqual({flow: [item["serial"] for item in arm["delivery_order"]
+                                     if item["flow"] == flow] for flow in range(4)},
+                             {flow: [0, 1] for flow in range(4)})
+        with self.assertRaisesRegex(TimingError, "cannot fit"):
+            Simulation((packet(0, 0, 65),), "D1",
+                       config(global_push_credit_bytes=64))
+
+    def test_sampled_gate_exposes_staleness_and_control_delay(self):
+        workload = (packet(0, 0, 256),)
+        instant = Simulation(workload, "D1-gated",
+                             config(ncp_gate_resident_lines=1)).run()
+        sampled = Simulation(workload, "D1-gated",
+                             config(ncp_gate_resident_lines=1,
+                                    ncp_gate_sample_interval_ns=1000)).run()
+        self.assertEqual(instant["adaptive_gate"]["ncp_lines"], 1)
+        self.assertEqual(sampled["adaptive_gate"]["ncp_lines"], 4)
+        self.assertEqual(sampled["gate_sampling"]["samples"], 1)
+        immediate = Simulation(workload, "D1-gated",
+                               config(ncp_gate_resident_lines=0,
+                                      ncp_gate_sample_interval_ns=1000)).run()
+        delayed = Simulation(workload, "D1-gated",
+                             config(ncp_gate_resident_lines=0,
+                                    ncp_gate_sample_interval_ns=1000,
+                                    ncp_gate_control_latency_ns=1000)).run()
+        self.assertEqual(immediate["adaptive_gate"]["ncp_lines"], 0)
+        self.assertEqual(delayed["adaptive_gate"]["ncp_lines"], 4)
+        self.assertEqual(delayed["gate_sampling"]["pending_control_writes"], 1)
 
     def test_demand_only_arm_fetches_correct_bytes_from_nic_home(self):
         result = Simulation((packet(0, 0, 65),), "E", config()).run()

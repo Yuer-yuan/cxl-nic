@@ -116,6 +116,9 @@ def validate_trace(events: Iterable[Mapping[str, Any]], require_drained: bool = 
     credit_limit = _integer(config.get("per_flow_credit_bytes"), "per_flow_credit_bytes", 1)
     max_packet_charge = ((max_packet_bytes + LINE_BYTES - 1) // LINE_BYTES) * LINE_BYTES
     _require(credit_limit >= max_packet_charge, "each flow needs credit for a complete maximum-size packet")
+    global_limit = config.get("global_push_credit_bytes")
+    if global_limit is not None:
+        global_limit = _integer(global_limit, "global_push_credit_bytes", max_packet_charge)
     initial = config.get("initial_serials")
     _require(isinstance(initial, Mapping) and bool(initial), "initial_serials must be a nonempty mapping")
     bases: dict[int, int] = {}
@@ -128,6 +131,8 @@ def validate_trace(events: Iterable[Mapping[str, Any]], require_drained: bool = 
     next_consume = dict(bases)
     credit = dict.fromkeys(bases, 0)
     peak_credit = dict.fromkeys(bases, 0)
+    global_credit = 0
+    global_peak = 0
     released_serials: dict[int, set[int]] = {flow: set() for flow in bases}
     pending_ready: dict[int, int] = {}
     generations: dict[tuple[int, int], int] = {}
@@ -215,7 +220,11 @@ def validate_trace(events: Iterable[Mapping[str, Any]], require_drained: bool = 
                                  "first write issued outside the contiguous packet prefix")
                         _require(credit[flow] + packet.charge <= credit_limit,
                                  "per-flow credit exceeded before release")
+                        _require(global_limit is None or global_credit + packet.charge <= global_limit,
+                                 "global push credit exceeded before release")
                         credit[flow] += packet.charge
+                        global_credit += packet.charge
+                        global_peak = max(global_peak, global_credit)
                         peak_credit[flow] = max(peak_credit[flow], credit[flow])
                         packet.charged = True
                         next_issue[flow] += 1
@@ -264,6 +273,7 @@ def validate_trace(events: Iterable[Mapping[str, Any]], require_drained: bool = 
                 _require(packet.charged, "released packet never reserved credit")
                 packet.released = True
                 credit[flow] -= packet.charge
+                global_credit -= packet.charge
                 del active_slots[(flow, packet.token.slot)]
                 released_serials[flow].add(packet.token.serial)
                 while bases[flow] in released_serials[flow]:
@@ -301,11 +311,14 @@ def validate_trace(events: Iterable[Mapping[str, Any]], require_drained: bool = 
         _require(outstanding_packets == 0, f"trace is not drained: {outstanding_packets} accepted packets await release")
         _require(pending_writes == 0, f"trace is not drained: {pending_writes} writes await visibility")
         _require(not any(credit.values()), "trace is not drained: credit remains reserved")
+        _require(global_credit == 0, "trace is not drained: global credit remains reserved")
     return {
         **counts,
         "pending_writes": pending_writes,
         "outstanding_packets": outstanding_packets,
         "peak_credit_bytes": {str(flow): value for flow, value in sorted(peak_credit.items())},
         "credit_bytes": {str(flow): value for flow, value in sorted(credit.items())},
+        "global_credit_bytes": global_credit,
+        "global_credit_peak_bytes": global_peak,
         "release_bases": {str(flow): value for flow, value in sorted(bases.items())},
     }

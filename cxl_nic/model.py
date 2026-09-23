@@ -27,9 +27,12 @@ class Config:
     sequence_bits: int = 8
     max_packet_bytes: int = 1500
     per_flow_credit_bytes: int = 3072
+    global_push_credit_bytes: Optional[int] = None
 
     def __post_init__(self):
         for name, value in asdict(self).items():
+            if name == "global_push_credit_bytes" and value is None:
+                continue
             if type(value) is not int or value <= 0:
                 raise ProtocolError(f"{name} must be a positive integer")
         if self.sequence_bits > 64:
@@ -38,6 +41,9 @@ class Config:
             raise ProtocolError("window must be smaller than half the sequence space")
         if self.per_flow_credit_bytes < aligned_size(self.max_packet_bytes):
             raise ProtocolError("each flow needs credit for a complete maximum-size packet")
+        if (self.global_push_credit_bytes is not None
+                and self.global_push_credit_bytes < aligned_size(self.max_packet_bytes)):
+            raise ProtocolError("global push credit must fit a complete maximum-size packet")
 
 
 @dataclass(frozen=True)
@@ -106,8 +112,9 @@ class Protocol:
     """One fixed session, SPSC delivery per flow, explicit sender epoch.
 
     The NIC stores complete packets in reserved per-flow slots. Each flow also
-    owns a fixed push-credit reservation: a paused consumer cannot take another
-    flow's allocation. CPU ownership lasts until release(), not acquire().
+    owns a fixed push-credit reservation. An optional global reservation also
+    bounds aggregate in-flight payload across flows. CPU ownership lasts until
+    release(), not acquire().
     """
 
     def __init__(self, config: Config = Config(), initial_serials=None):
@@ -121,6 +128,7 @@ class Protocol:
         self._flows = {f: _Flow(s, s, s, s) for f, s in initial_serials.items()}
         self._flow_order = sorted(self._flows)
         self._round_robin = 0
+        self._global_credit = 0
         self._host = {
             (f, slot): _HostSlot(bytearray([0xA5]) * aligned_size(config.max_packet_bytes))
             for f in self._flows for slot in range(config.window)
@@ -199,7 +207,11 @@ class Protocol:
                 size = aligned_size(len(packet.payload))
                 if state.credit + size > self.config.per_flow_credit_bytes:
                     continue
+                if (self.config.global_push_credit_bytes is not None
+                        and self._global_credit + size > self.config.global_push_credit_bytes):
+                    continue
                 state.credit += size
+                self._global_credit += size
                 packet.phase = "PUSHING"
                 padded = packet.payload.ljust(size, b"\0")
                 for line in range(0, size, LINE_BYTES):
@@ -304,6 +316,7 @@ class Protocol:
         if any(w.token == token for w in self.pending.values()):
             raise ProtocolError("release while old physical writes remain in flight")
         state.credit -= aligned_size(len(packet.payload))
+        self._global_credit -= aligned_size(len(packet.payload))
         del state.packets[token.serial]
         state.released.add(token.serial)
         while state.base in state.released:
@@ -322,6 +335,9 @@ class Protocol:
 
     def check_invariants(self):
         """Internal assertions complement the independent trace checker."""
+        assert self._global_credit == sum(state.credit for state in self._flows.values())
+        assert (self.config.global_push_credit_bytes is None
+                or self._global_credit <= self.config.global_push_credit_bytes)
         for flow, state in self._flows.items():
             assert state.base <= state.next_consume <= state.next_publish <= state.next_issue
             assert len(state.packets) + len(state.released) <= self.config.window

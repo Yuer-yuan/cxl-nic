@@ -66,6 +66,12 @@ class GuestPatternTests(unittest.TestCase):
             run_case(*arguments, device_type="type2", data_path="ncp",
                      ncp_gate_resident_lines=8, ncp_post_push="before-ready")
 
+    def test_adversarial_hold_requires_two_maximum_packet_reservations(self):
+        arguments = (None, None, None, None, None, "adversarial", 4, 1)
+        with self.assertRaisesRegex(ValueError, "both initial maximum-size packets"):
+            run_case(*arguments, device_type="type2", data_path="ncp",
+                     global_push_credit_bytes=1536)
+
     def test_pattern_golden_vectors_cover_endianness_flow_and_partial_word(self):
         vectors = (
             ((0, 0, 0, 16), "0000000000000000737a5367a08f5ab5"),

@@ -9,7 +9,7 @@ from dataclasses import replace
 import hashlib
 import unittest
 
-from cxl_nic.checker import validate_trace
+from cxl_nic.checker import TraceViolation, validate_trace
 from cxl_nic.model import Config, Protocol, ProtocolError
 
 
@@ -103,9 +103,41 @@ class ProtocolTests(unittest.TestCase):
             {"max_packet_bytes": 0},
             {"per_flow_credit_bytes": 1500},
             {"per_flow_credit_bytes": 1535},
+            {"global_push_credit_bytes": 1535},
+            {"global_push_credit_bytes": True},
         ):
             with self.subTest(changes=changes), self.assertRaises(ProtocolError):
                 Config(**changes)
+
+    def test_global_push_budget_blocks_other_flow_until_release(self):
+        protocol = Protocol(Config(global_push_credit_bytes=1536), {0: 0, 1: 0})
+        for flow in (0, 1):
+            self.receive(protocol, 0, self.payload(1500, flow), flow=flow)
+        self.assertEqual(protocol.pump(), 1)
+        self.assertEqual({write.token.flow for write in protocol.pending.values()}, {0})
+        self.publish(protocol, 0, flow=0)
+        first = self.assert_delivery(protocol, 0, self.payload(1500, 0), flow=0)
+        self.assertEqual(protocol.pump(), 0)
+        protocol.release(first.token)
+        self.assertEqual(protocol.pump(), 1)
+        self.publish(protocol, 0, flow=1)
+        second = self.assert_delivery(protocol, 0, self.payload(1500, 1), flow=1)
+        protocol.release(second.token)
+        checked = validate_trace(protocol.trace)
+        self.assertEqual(checked["global_credit_peak_bytes"], 1536)
+        self.assertEqual(checked["global_credit_bytes"], 0)
+        too_small = deepcopy(protocol.trace)
+        too_small[0]["global_push_credit_bytes"] = 1535
+        with self.assertRaisesRegex(TraceViolation, "global_push_credit_bytes"):
+            validate_trace(too_small)
+        unconstrained = Protocol(Config(), {0: 0, 1: 0})
+        for flow in (0, 1):
+            unconstrained.receive(flow, 0, 0, self.payload(1500, flow))
+        self.assertEqual(unconstrained.pump(), 2)
+        over_budget = deepcopy(unconstrained.trace)
+        over_budget[0]["global_push_credit_bytes"] = 1536
+        with self.assertRaisesRegex(TraceViolation, "global push credit exceeded"):
+            validate_trace(over_budget, require_drained=False)
 
     def test_malformed_packet_does_not_reserve_or_publish_a_slot(self):
         protocol = self.make_protocol()

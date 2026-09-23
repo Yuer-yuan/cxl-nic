@@ -142,7 +142,8 @@ def qemu_command(binary, guest, device_type="type3", port=None):
 
 def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
              device_type="type3", data_path="legacy", llc_sets=64, llc_ways=8,
-             ncp_post_push="none", ncp_gate_resident_lines=None):
+             ncp_post_push="none", ncp_gate_resident_lines=None,
+             global_push_credit_bytes=None):
     if data_path not in ("legacy", "ncp", "ddio"):
         raise ValueError("data_path must be legacy, ncp, or ddio")
     if data_path in ("ncp", "ddio") and device_type != "type2":
@@ -158,6 +159,11 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
         raise ValueError("adaptive gating requires adversarial NC-P mode")
     if ncp_gate_resident_lines is not None and ncp_post_push != "none":
         raise ValueError("adaptive gating and post-push withdrawal are separate policies")
+    if (global_push_credit_bytes is not None
+            and (type(global_push_credit_bytes) is not int or global_push_credit_bytes < 1536)):
+        raise ValueError("global_push_credit_bytes must fit one maximum-size packet")
+    if mode == "adversarial" and global_push_credit_bytes is not None and global_push_credit_bytes < 3072:
+        raise ValueError("adversarial hold requires credit for both initial maximum-size packets")
     directory.mkdir()
     port = available_port()
     nonce = secrets.randbits(64)
@@ -176,12 +182,13 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
               "data_path": data_path,
               "ncp_post_push": ncp_post_push,
               "ncp_gate_resident_lines": ncp_gate_resident_lines,
+              "global_push_credit_bytes": global_push_credit_bytes,
               "backend": ({"ncp": "explicit NC-P with NIC-memory backing",
                            "ddio": "modeled DDIO with host-memory backing"}[data_path]
                           if data_path != "legacy" else
                           f"legacy TCP authoritative {device_type.capitalize()} memory"),
               "fault_injected": False}
-    protocol = Protocol(Config(), INITIAL)
+    protocol = Protocol(Config(global_push_credit_bytes=global_push_credit_bytes), INITIAL)
     server_process = guest_process = client = output = None
     log = (directory / "server.log").open("wb")
     deadline = time.monotonic() + timeout
@@ -481,6 +488,7 @@ def main(argv=None):
     parser.add_argument("--host-llc-ways", "--ncp-ways", dest="host_llc_ways", type=int, default=8)
     parser.add_argument("--ncp-post-push", choices=("none", "before-ready"), default="none")
     parser.add_argument("--ncp-gate-resident-lines", type=int)
+    parser.add_argument("--global-push-credit-bytes", type=int)
     parser.add_argument("--case", choices=("all", "adversarial", "early-ready", "corrupt-payload"), default="all")
     args = parser.parse_args(argv)
     if args.packets_per_flow < 4 or args.timeout <= 0:
@@ -495,6 +503,11 @@ def main(argv=None):
         parser.error("--ncp-gate-resident-lines requires --data-path ncp --case adversarial")
     if args.ncp_gate_resident_lines is not None and args.ncp_post_push != "none":
         parser.error("adaptive gating and post-push withdrawal are separate policies")
+    if args.global_push_credit_bytes is not None and args.global_push_credit_bytes < 1536:
+        parser.error("--global-push-credit-bytes must fit one maximum-size packet")
+    if (args.case in ("all", "adversarial") and args.global_push_credit_bytes is not None
+            and args.global_push_credit_bytes < 3072):
+        parser.error("adversarial hold requires credit for both initial maximum-size packets")
     if (args.host_llc_sets <= 0 or args.host_llc_ways <= 0 or args.host_llc_sets > 65536
             or args.host_llc_ways > 64 or args.host_llc_sets * args.host_llc_ways > 1048576):
         parser.error("host LLC dimensions are out of range")
@@ -505,6 +518,7 @@ def main(argv=None):
               "data_path": args.data_path,
               "ncp_post_push": args.ncp_post_push,
               "ncp_gate_resident_lines": args.ncp_gate_resident_lines,
+              "global_push_credit_bytes": args.global_push_credit_bytes,
               "scope": (f"RISC-V guest functional publication over {args.device_type.capitalize()} "
                         + ("explicit finite simulated host LLC; no physical LLC/ISA proof"
                            if args.data_path != "legacy" else
@@ -532,7 +546,8 @@ def main(argv=None):
                             ROOT / "thirdparty/cxlmemsim/qemu_integration/topology_simple.txt",
                             mode, args.packets_per_flow, args.timeout, args.device_type,
                             args.data_path, args.host_llc_sets, args.host_llc_ways,
-                            args.ncp_post_push, args.ncp_gate_resident_lines)
+                            args.ncp_post_push, args.ncp_gate_resident_lines,
+                            args.global_push_credit_bytes)
             result["cases"].append(case)
         result["status"] = "passed"
     except Exception as error:
