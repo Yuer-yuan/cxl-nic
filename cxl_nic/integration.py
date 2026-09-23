@@ -1,7 +1,7 @@
-"""RISC-V guest validation over a pinned CXLMemSim Type2 or Type3 endpoint.
+"""RISC-V guest publication checks over pinned QEMU and CXLMemSim endpoints.
 
-The Type2 NC-P mode sends explicit push operations into CXLMemSim's finite host
-LLC model. It remains a simulator mechanism, not a physical CPU-cache claim.
+Type2 NC-P can use either the older CXLMemSim cache model or QEMU's host-side
+cache model. Neither path represents a physical CPU cache or CXL.cache timing.
 """
 
 import argparse
@@ -37,7 +37,7 @@ RELEASE_OFFSET = 128
 TYPE2_DPA_BASE = 0x200000
 INITIAL = {0: 254, 1: 510}
 FIELDS = ("flow", "serial", "slot", "generation", "length")
-PINS = {"qemu": "59727bed3113942d6b7e1f61b1c08e02cc44e1c4",
+PINS = {"qemu": "7b3abd24a26814c3e1ded4f78c985b3a6a8a9e59",
         "cxlmemsim": "b5e183ea9732fa023c5df1a749a857430c3a237b"}
 
 
@@ -189,7 +189,8 @@ class GateController:
                 "nc_write_lines": self.nc_write_lines}
 
 
-def qemu_command(binary, guest, device_type="type3", port=None):
+def qemu_command(binary, guest, device_type="type3", port=None,
+                 ncp_port=None, llc_sets=64, llc_ways=8):
     command = [str(binary), "-M", "sifive_u", "-machine",
                "cxl=on,cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=256M",
                "-smp", "2", "-m", "256M", "-bios", "none", "-kernel", str(guest),
@@ -203,23 +204,31 @@ def qemu_command(binary, guest, device_type="type3", port=None):
         raise ValueError("device_type must be type2 or type3")
     if type(port) is not int or not 0 < port <= 65535:
         raise ValueError("a valid CXLMemSim port is required for Type2")
+    type2 = ("cxl-type2,bus=rp-t2,id=t2,sn=200,gpu-mode=0,"
+             "cache-size=1M,mem-size=256M,"
+             "cxlmemsim-addr=127.0.0.1,"
+             f"cxlmemsim-port={port},coherency-enabled=true")
+    if ncp_port is not None:
+        type2 += (f",ncp-ingress-port={ncp_port},ncp-host-sets={llc_sets},"
+                  f"ncp-host-ways={llc_ways}")
     return command + ["-device", "pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl.1",
                       "-device", "cxl-rp,bus=cxl.1,port=0,id=rp-t2,chassis=0,slot=0",
-                      "-device", ("cxl-type2,bus=rp-t2,id=t2,sn=200,gpu-mode=0,"
-                                  "cache-size=1M,mem-size=256M,"
-                                  "cxlmemsim-addr=127.0.0.1,"
-                                  f"cxlmemsim-port={port},coherency-enabled=true")]
+                      "-device", type2]
 
 
 def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
              device_type="type3", data_path="legacy", llc_sets=64, llc_ways=8,
              ncp_post_push="none", ncp_gate_resident_lines=None,
              global_push_credit_bytes=None, ncp_gate_sample_every_lines=None,
-             ncp_gate_control_delay_lines=0):
+             ncp_gate_control_delay_lines=0, llc_owner="cxlmemsim"):
     if data_path not in ("legacy", "ncp", "ddio"):
         raise ValueError("data_path must be legacy, ncp, or ddio")
     if data_path in ("ncp", "ddio") and device_type != "type2":
         raise ValueError("modeled cache injection requires a Type2 endpoint")
+    if llc_owner not in ("cxlmemsim", "qemu"):
+        raise ValueError("llc_owner must be cxlmemsim or qemu")
+    if llc_owner == "qemu" and (device_type != "type2" or data_path == "legacy"):
+        raise ValueError("QEMU host cache requires Type2 NC-P or DDIO mode")
     if ncp_post_push not in ("none", "before-ready"):
         raise ValueError("ncp_post_push must be none or before-ready")
     if ncp_post_push != "none" and (data_path != "ncp" or mode != "adversarial"):
@@ -244,11 +253,15 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
         raise ValueError("adversarial hold requires credit for both initial maximum-size packets")
     directory.mkdir()
     port = available_port()
+    ncp_port = available_port() if llc_owner == "qemu" else None
+    while ncp_port == port:
+        ncp_port = available_port()
     nonce = secrets.randbits(64)
     server_argv = [str(server), "--comm-mode=tcp", f"--port={port}", "--capacity=256",
                    "--backing-mode=file", f"--backing-file={directory / 'backing.raw'}",
                    f"--topology={topology}"]
-    qemu_argv = qemu_command(qemu, guest, device_type, port)
+    qemu_argv = qemu_command(qemu, guest, device_type, port, ncp_port,
+                             llc_sets, llc_ways)
     server_environment = {**os.environ, "CXL_BASE_ADDR": "0"}
     qemu_environment = {**os.environ, "CXL_TRANSPORT_MODE": "tcp",
                         "CXL_MEMSIM_HOST": "127.0.0.1", "CXL_MEMSIM_PORT": str(port),
@@ -258,6 +271,7 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
               "packets_per_flow": count, "device_type": device_type,
               "backend_dpa_base": backend_address(0, device_type),
               "data_path": data_path,
+              "llc_owner": llc_owner,
               "ncp_post_push": ncp_post_push,
               "ncp_gate_resident_lines": ncp_gate_resident_lines,
               "ncp_gate_sample_every_lines": ncp_gate_sample_every_lines,
@@ -269,7 +283,7 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                           f"legacy TCP authoritative {device_type.capitalize()} memory"),
               "fault_injected": False}
     protocol = Protocol(Config(global_push_credit_bytes=global_push_credit_bytes), INITIAL)
-    server_process = guest_process = client = output = None
+    server_process = guest_process = client = cache_client = output = None
     log = (directory / "server.log").open("wb")
     deadline = time.monotonic() + timeout
     try:
@@ -284,7 +298,7 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                 client = Client(("127.0.0.1", port), timeout=min(5.0, timeout))
             except OSError:
                 time.sleep(0.05)
-        if data_path != "legacy":
+        if data_path != "legacy" and llc_owner == "cxlmemsim":
             client.configure_host_llc(llc_sets, llc_ways)
         control = struct.pack("<8Q", MAGIC, nonce, count, INITIAL[0], INITIAL[1], 2, 4, 1500)
         client.write(backend_address(0, device_type), control)
@@ -298,6 +312,18 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                                          stdin=subprocess.DEVNULL, env=qemu_environment,
                                          start_new_session=True, bufsize=0)
         output = GuestOutput(guest_process, directory / "guest.log")
+        if llc_owner == "qemu":
+            while cache_client is None:
+                if guest_process.poll() is not None:
+                    raise RuntimeError("QEMU exited before host cache ingress connected")
+                if time.monotonic() > deadline:
+                    raise TimeoutError("QEMU host cache ingress did not start")
+                try:
+                    cache_client = Client(("127.0.0.1", ncp_port), timeout=min(5.0, timeout))
+                except OSError:
+                    time.sleep(0.05)
+            cache_client.configure_host_llc(llc_sets, llc_ways)
+        producer = cache_client or client
         lengths = (1500, 65, 64, 63, 1, 256)
         payloads = {f: {s: pattern(nonce, f, s, lengths[(s - start) % len(lengths)])
                         for s in range(start, start + count)} for f, start in INITIAL.items()}
@@ -411,8 +437,8 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                     payload = payloads[token.flow][token.serial]
                     for offset in range(0, len(payload), 64):
                         address = slot_address(token) + PAYLOAD_OFFSET + offset
-                        client.ncp_nc_write(backend_address(address, device_type),
-                                            payload[offset:offset + 64])
+                        producer.ncp_nc_write(backend_address(address, device_type),
+                                              payload[offset:offset + 64])
                         withdrawal_lines += 1
                     withdrawn.add(token)
 
@@ -438,14 +464,14 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                     result["fault_injected"] = True
                 target_address = backend_address(address, device_type)
                 if data_path == "ncp" and write.kind == "payload" and gate is not None:
-                    if gate.choose_push(lambda: client.query_ncp()["resident"]):
-                        client.ncp_write(target_address, data)
+                    if gate.choose_push(lambda: producer.query_ncp()["resident"]):
+                        producer.ncp_write(target_address, data)
                     else:
-                        client.ncp_nc_write(target_address, data)
+                        producer.ncp_nc_write(target_address, data)
                 elif data_path != "legacy" and write.kind in ("payload", "ready"):
-                    (client.ncp_write if data_path == "ncp" else client.ddio_write)(target_address, data)
+                    (producer.ncp_write if data_path == "ncp" else producer.ddio_write)(target_address, data)
                 else:
-                    client.write(target_address, data)
+                    producer.write(target_address, data)
                 protocol.complete(write.op_id)
             if mode == "early-ready" and first_target is not None and not result["fault_injected"]:
                 waiting = [w for w in protocol.pending.values() if w.token == first_target]
@@ -453,9 +479,9 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                     ready = backend_address(slot_address(first_target) + READY_OFFSET, device_type)
                     ready_data = struct.pack("<Q", first_target.generation)
                     if data_path != "legacy":
-                        (client.ncp_write if data_path == "ncp" else client.ddio_write)(ready, ready_data)
+                        (producer.ncp_write if data_path == "ncp" else producer.ddio_write)(ready, ready_data)
                     else:
-                        client.write(ready, ready_data)
+                        producer.write(ready, ready_data)
                     result["fault_injected"] = True
             protocol.check_invariants()
             if guest_done:
@@ -475,11 +501,11 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
             if not eligible:
                 time.sleep(0.001)
 
-        result["producer_backend_reads"] = client.reads
-        result["producer_backend_writes"] = client.writes
+        result["producer_backend_reads"] = client.reads + (cache_client.reads if cache_client else 0)
+        result["producer_backend_writes"] = client.writes + (cache_client.writes if cache_client else 0)
         if data_path != "legacy":
-            cache = (client.query_ncp if data_path == "ncp" else client.query_ddio)()
-            cache.update(client.query_host_llc_traffic())
+            cache = (producer.query_ncp if data_path == "ncp" else producer.query_ddio)()
+            cache.update(producer.query_host_llc_traffic())
             demand_by_kind = {kind: {"lines": 0, "hits": 0}
                               for kind in ("payload", "ready")}
             payload_span = ((max(lengths) + 63) // 64) * 64
@@ -488,7 +514,7 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                     base = SLOT_BASE + (flow * 4 + slot) * SLOT_STRIDE
                     for kind, offset, span in (("payload", PAYLOAD_OFFSET, payload_span),
                                                ("ready", READY_OFFSET, 64)):
-                        observed = client.query_first_demands(
+                        observed = producer.query_first_demands(
                             backend_address(base + offset, device_type), span)
                         demand_by_kind[kind]["lines"] += observed["lines"]
                         demand_by_kind[kind]["hits"] += observed["hits"]
@@ -505,13 +531,19 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                 raise RuntimeError("successful guest did not demand every payload and ready line")
             cache["payload_first_demand"] = demand_by_kind["payload"]
             cache["ready_first_demand"] = demand_by_kind["ready"]
-            cache.update(nc_writes=client.ncp_nc_writes,
-                         nc_write_bytes=client.ncp_nc_write_bytes,
+            cache.update(nc_writes=producer.ncp_nc_writes,
+                         nc_write_bytes=producer.ncp_nc_write_bytes,
                          gated_push_lines=gate.push_lines if gate is not None else 0,
                          gated_nc_write_lines=gate.nc_write_lines if gate is not None else 0)
-            completed = client.ncp_writes if data_path == "ncp" else client.ddio_writes
+            completed = producer.ncp_writes if data_path == "ncp" else producer.ddio_writes
             result[data_path] = {**cache, "configured_sets": llc_sets,
                                  "configured_ways": llc_ways}
+            if llc_owner == "qemu":
+                server_cache = client.query_ncp()
+                result["cxlmemsim_cache_bypass"] = server_cache
+                if (server_cache["pushes"] or server_cache["host_reads"]
+                        or server_cache["first_demands"]):
+                    raise RuntimeError("QEMU cache run also used the CXLMemSim LLC model")
             if (cache["pushes"] != completed
                     or cache["first_demands"] == 0
                     or cache["first_demand_hits"] > cache["first_demands"]):
@@ -527,17 +559,17 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                     or dirty_backing[other_home] != 0
                     or cache["backing_read_bytes"][expected_home] < first_backing[expected_home]
                     or cache["backing_read_bytes"][other_home] != 0
-                    or producer_backing["nic"] != client.ncp_nc_writes * 64
+                    or producer_backing["nic"] != producer.ncp_nc_writes * 64
                     or producer_backing["host"] != (completed * 64 if data_path == "ddio" else 0)):
                 raise RuntimeError("cache backing-home traffic is inconsistent")
             if (ncp_post_push == "before-ready"
-                    and (withdrawal_lines != client.ncp_nc_writes
+                    and (withdrawal_lines != producer.ncp_nc_writes
                          or cache["first_demand_misses"] < withdrawal_lines)):
                 raise RuntimeError("post-push NC-write did not force payload fallback")
             if (gate is not None
                     and (gate.lines != result["payload_lines"]
                          or not gate.push_lines or not gate.nc_write_lines
-                         or gate.nc_write_lines != client.ncp_nc_writes
+                         or gate.nc_write_lines != producer.ncp_nc_writes
                          or cache["first_demand_misses"] < gate.nc_write_lines)):
                 raise RuntimeError("adaptive gate did not exercise both push and NC-write")
             result["withdrawal_lines"] = withdrawal_lines
@@ -553,6 +585,8 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
             output.close()
         if client is not None:
             client.close()
+        if cache_client is not None:
+            cache_client.close()
         stop_owned(server_process)
         log.close()
         save_trace(directory / "events.jsonl", protocol.trace)
@@ -563,6 +597,8 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                      and "CXL Type2: Connected to CXLMemSim" in guest_log
                      and "CXL Type2: Device realized" in guest_log))
     if (not connected
+            or (llc_owner == "qemu"
+                and "CXL Type2: QEMU host NC-P cache active" not in guest_log)
             or re.search(r"CXL Type[23]:.*(?:failed|Failed|denied|falling back)", guest_log)):
         result.update(status="failed", error="guest transport connection/fallback check failed")
         (directory / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
@@ -588,6 +624,7 @@ def main(argv=None):
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--device-type", choices=("type2", "type3"), default="type3")
     parser.add_argument("--data-path", choices=("legacy", "ncp", "ddio"), default="legacy")
+    parser.add_argument("--llc-owner", choices=("cxlmemsim", "qemu"), default="cxlmemsim")
     parser.add_argument("--host-llc-sets", "--ncp-sets", dest="host_llc_sets", type=int, default=64)
     parser.add_argument("--host-llc-ways", "--ncp-ways", dest="host_llc_ways", type=int, default=8)
     parser.add_argument("--ncp-post-push", choices=("none", "before-ready"), default="none")
@@ -601,6 +638,8 @@ def main(argv=None):
         parser.error("at least four packets per flow and a positive timeout are required")
     if args.data_path in ("ncp", "ddio") and args.device_type != "type2":
         parser.error("modeled cache injection requires --device-type type2")
+    if args.llc_owner == "qemu" and (args.device_type != "type2" or args.data_path == "legacy"):
+        parser.error("--llc-owner qemu requires Type2 NC-P or DDIO mode")
     if args.ncp_post_push != "none" and (args.data_path != "ncp" or args.case != "adversarial"):
         parser.error("--ncp-post-push requires --data-path ncp --case adversarial")
     if args.ncp_gate_resident_lines is not None and args.ncp_gate_resident_lines < 0:
@@ -632,13 +671,15 @@ def main(argv=None):
     result = {"status": "running", "cases": [], "pins": PINS,
               "device_type": args.device_type,
               "data_path": args.data_path,
+              "llc_owner": args.llc_owner,
               "ncp_post_push": args.ncp_post_push,
               "ncp_gate_resident_lines": args.ncp_gate_resident_lines,
               "ncp_gate_sample_every_lines": args.ncp_gate_sample_every_lines,
               "ncp_gate_control_delay_lines": args.ncp_gate_control_delay_lines,
               "global_push_credit_bytes": args.global_push_credit_bytes,
               "scope": (f"RISC-V guest functional publication over {args.device_type.capitalize()} "
-                        + ("explicit finite simulated host LLC; no physical LLC/ISA proof"
+                        + (f"finite {args.llc_owner} host-cache model; "
+                           "BAR4 MMIO, no physical LLC or CXL.cache timing proof"
                            if args.data_path != "legacy" else
                            "legacy TCP; no NC-P/LLC/ISA proof"))}
     try:
@@ -667,7 +708,7 @@ def main(argv=None):
                             args.ncp_post_push, args.ncp_gate_resident_lines,
                             args.global_push_credit_bytes,
                             args.ncp_gate_sample_every_lines,
-                            args.ncp_gate_control_delay_lines)
+                            args.ncp_gate_control_delay_lines, args.llc_owner)
             result["cases"].append(case)
         result["status"] = "passed"
     except Exception as error:

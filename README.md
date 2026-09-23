@@ -70,6 +70,26 @@ python3 -m cxl_nic.integration --device-type type2 --data-path ncp \
     --output results/integration-global-budget-001
 ```
 
+Use `--llc-owner qemu` for the QEMU-side host cache experiment. Build the pinned
+QEMU revision first, then run matched NC-P and DDIO cases:
+
+```bash
+python3 -m cxl_nic.integration --device-type type2 --data-path ncp \
+    --llc-owner qemu --output results/integration-qemu-ncp-001
+python3 -m cxl_nic.integration --device-type type2 --data-path ddio \
+    --llc-owner qemu --output results/integration-qemu-ddio-001
+```
+
+In this mode, the Python producer sends writes to the Type2 model's localhost
+ingress. QEMU completes NC-P only after installing the line in its shared host
+cache model. Guest loads consult that same cache, and misses fetch from
+CXLMemSim backing. Dirty NC-P evictions write back to NIC backing; modeled DDIO
+first updates host backing and installs a clean line. The run checks that
+CXLMemSim's older LLC model sees no host demands or pushes. The guest still
+uses the Type2 BAR4 MMIO window, and the localhost ingress represents NIC
+commands rather than encoded CXL.cache packets. This is a stronger functional
+cache-path check, not a cacheable Type2 CXL.mem mapping or timing validation.
+
 Run the Type2 gate sensitivity sweep on Giga:
 
 ```bash
