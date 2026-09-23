@@ -82,13 +82,14 @@ python3 -m cxl_nic.integration --device-type type2 --data-path ddio \
 
 In this mode, the Python producer sends writes to the Type2 model's localhost
 ingress. QEMU completes NC-P only after installing the line in its shared host
-cache model. Guest loads consult that same cache, and misses fetch from
-CXLMemSim backing. Dirty NC-P evictions write back to NIC backing; modeled DDIO
-first updates host backing and installs a clean line. The run checks that
-CXLMemSim's older LLC model sees no host demands or pushes. The guest still
-uses the Type2 BAR4 MMIO window, and the localhost ingress represents NIC
-commands rather than encoded CXL.cache packets. This is a stronger functional
-cache-path check, not a cacheable Type2 CXL.mem mapping or timing validation.
+cache model. The guest reads Type2 device memory through a committed HDM decoder
+and QEMU's CXL fixed memory window. A host-cache miss fetches from CXLMemSim
+NIC backing through the Type2 CXL.mem request path. Dirty NC-P evictions write
+back to NIC backing; modeled DDIO first updates host backing and installs a
+clean line. The run checks that CXLMemSim's older LLC model sees no host
+demands or pushes. The localhost ingress represents NIC commands rather than
+encoded CXL.cache packets, and the QEMU cache remains a functional host-cache
+model rather than a physical CPU cache or CXL.cache timing validation.
 
 Run the Type2 gate sensitivity sweep on Giga:
 

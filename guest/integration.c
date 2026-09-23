@@ -1,10 +1,9 @@
 /* Freestanding consumer for the pinned CXLMemSim-riscv SiFive U machine.
- * This checks actual guest loads. It does not model an LLC or NC-P traffic.
+ * Guest loads use the CXL fixed memory window for Type 2 and Type 3.
  */
 #include <stdint.h>
 
 #define CXL_BASE UINT64_C(0x1000000000)
-#define TYPE2_BAR4_BASE UINT64_C(0x400000000)
 #define TYPE2_DPA_BASE UINT64_C(0x200000)
 #define RP_CONFIG UINT64_C(0x34000000)
 #define DEVICE_CONFIG UINT64_C(0x34100000)
@@ -156,12 +155,6 @@ static void configure_cxl(void)
     store16(DEVICE_CONFIG + 0x04, 6);
     fence_io();
 
-    if (type2) {
-        data_base = TYPE2_BAR4_BASE + TYPE2_DPA_BASE;
-        cxl_configured = 1;
-        return;
-    }
-
     /* Pinned QEMU's CXL HDM capability starts at cache/mem offset 0x128.
      * One root port uses host bridge passthrough, so only the endpoint HDM
      * decoder is needed. Decoder 0 maps the 256 MiB FMW to DPA zero.
@@ -177,6 +170,9 @@ static void configure_cxl(void)
     fence_io();
     if ((load32(CACHE_MEM + 0x148) & UINT32_C(0xc00)) != UINT32_C(0x400)) {
         fail(3, 0, 0, CACHE_MEM + 0x148);
+    }
+    if (type2) {
+        data_base = CXL_BASE + TYPE2_DPA_BASE;
     }
     cxl_configured = 1;
 }

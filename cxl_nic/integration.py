@@ -1,7 +1,8 @@
 """RISC-V guest publication checks over pinned QEMU and CXLMemSim endpoints.
 
-Type2 NC-P can use either the older CXLMemSim cache model or QEMU's host-side
-cache model. Neither path represents a physical CPU cache or CXL.cache timing.
+Type2 guest loads use an HDM fixed window. NC-P can use either CXLMemSim's
+older cache model or QEMU's host-side cache model; neither represents a
+physical CPU cache or CXL.cache link timing.
 """
 
 import argparse
@@ -37,7 +38,7 @@ RELEASE_OFFSET = 128
 TYPE2_DPA_BASE = 0x200000
 INITIAL = {0: 254, 1: 510}
 FIELDS = ("flow", "serial", "slot", "generation", "length")
-PINS = {"qemu": "7b3abd24a26814c3e1ded4f78c985b3a6a8a9e59",
+PINS = {"qemu": "09f89ac5d7bdfa1d08ac2104fa129ab293194dbc",
         "cxlmemsim": "b5e183ea9732fa023c5df1a749a857430c3a237b"}
 
 
@@ -271,6 +272,7 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
               "packets_per_flow": count, "device_type": device_type,
               "backend_dpa_base": backend_address(0, device_type),
               "data_path": data_path,
+              "guest_memory_path": "type2_hdm_cxl_mem" if device_type == "type2" else "type3_hdm_cxl_mem",
               "llc_owner": llc_owner,
               "ncp_post_push": ncp_post_push,
               "ncp_gate_resident_lines": ncp_gate_resident_lines,
@@ -597,6 +599,8 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                      and "CXL Type2: Connected to CXLMemSim" in guest_log
                      and "CXL Type2: Device realized" in guest_log))
     if (not connected
+            or (device_type == "type2" and
+                "CXL Type2: CXL.mem HDM read path active" not in guest_log)
             or (llc_owner == "qemu"
                 and "CXL Type2: QEMU host NC-P cache active" not in guest_log)
             or re.search(r"CXL Type[23]:.*(?:failed|Failed|denied|falling back)", guest_log)):
@@ -679,7 +683,8 @@ def main(argv=None):
               "global_push_credit_bytes": args.global_push_credit_bytes,
               "scope": (f"RISC-V guest functional publication over {args.device_type.capitalize()} "
                         + (f"finite {args.llc_owner} host-cache model; "
-                           "BAR4 MMIO, no physical LLC or CXL.cache timing proof"
+                           "Type2 HDM CXL.mem request path, no physical LLC or "
+                           "CXL.cache link timing proof"
                            if args.data_path != "legacy" else
                            "legacy TCP; no NC-P/LLC/ISA proof"))}
     try:
