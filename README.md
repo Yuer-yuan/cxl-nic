@@ -45,7 +45,7 @@ rsync -az --exclude=/build/ --exclude=/results/ --exclude=/audit/ \
 ```
 
 The preparation script creates independent checkouts without changing the reference
-repository. Without `CXLMEMSIM_REFERENCE_COMPONENTS`, it fetches from GitHub.
+repository. It fetches a pinned revision from GitHub if the reference lacks it.
 Then build and run on Giga (Debian/Ubuntu; dependency installation requires root):
 
 ```bash
@@ -69,6 +69,21 @@ python3 -m cxl_nic.integration --device-type type2 --data-path ncp \
     --case adversarial --global-push-credit-bytes 3072 \
     --output results/integration-global-budget-001
 ```
+
+Run the Type2 gate sensitivity sweep on Giga:
+
+```bash
+bash scripts/verify_integration_gate_sweep.sh results/integration-gate-sweep-001
+```
+
+It holds the packet workload fixed while varying LLC capacity, aggregate push
+credit, and host flag sampling. In this integration sweep, sampling and control
+delay count payload-line writes; they are deterministic event intervals rather
+than elapsed nanoseconds or physical CXL.io flag writes. The producer-side
+controller selects NC-P or NC-write using the held flag. The instant gate and
+one-line sampling are controls for the sampled cases. The server records first
+CPU demand separately for packet payload and ready lines, and checks that their
+totals equal the original whole-cache demand counters.
 
 In NC-P mode, QEMU registers its Type2 connection as the host requester and
 CXLMemSim installs pushed cache lines in a finite set-associative host-LLC model.

@@ -5,7 +5,7 @@ import struct
 import unittest
 
 from cxl_nic.checker import TraceViolation, validate_trace
-from cxl_nic.integration import (backend_address, pattern, qemu_command,
+from cxl_nic.integration import (GateController, backend_address, pattern, qemu_command,
                                  run_case, slot_address, write_address)
 from cxl_nic.model import Config, Protocol, ProtocolError, Token, Write
 
@@ -65,6 +65,35 @@ class GuestPatternTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "separate policies"):
             run_case(*arguments, device_type="type2", data_path="ncp",
                      ncp_gate_resident_lines=8, ncp_post_push="before-ready")
+        with self.assertRaisesRegex(ValueError, "requires ncp_gate_resident_lines"):
+            run_case(*arguments, device_type="type2", data_path="ncp",
+                     ncp_gate_sample_every_lines=8)
+        with self.assertRaisesRegex(ValueError, "sampled gating"):
+            run_case(*arguments, device_type="type2", data_path="ncp",
+                     ncp_gate_resident_lines=8, ncp_gate_control_delay_lines=2)
+
+    def test_sampled_gate_holds_flag_and_applies_control_after_payload_lines(self):
+        instant = GateController(1)
+        every_line = GateController(1, sample_every_lines=1)
+        residents = (0, 1, 1, 0, 1)
+        self.assertEqual([instant.choose_push(lambda value=value: value)
+                          for value in residents],
+                         [every_line.choose_push(lambda value=value: value)
+                          for value in residents])
+        self.assertEqual(instant.snapshot()["samples"], len(residents))
+        self.assertEqual(every_line.snapshot()["samples"], len(residents))
+        for delay, expected in ((0, [True] * 4 + [False] * 4),
+                                (2, [True] * 6 + [False] * 2)):
+            with self.subTest(delay=delay):
+                sampled = GateController(1, sample_every_lines=4,
+                                         control_delay_lines=delay)
+                observations = iter((0, 1))
+                choices = [sampled.choose_push(lambda: next(observations))
+                           for _ in range(8)]
+                self.assertEqual(choices, expected)
+                self.assertEqual(sampled.snapshot()["samples"], 2)
+                self.assertEqual(sampled.snapshot()["control_writes"], 1)
+                self.assertEqual(sampled.snapshot()["pending_control_writes"], 0)
 
     def test_adversarial_hold_requires_two_maximum_packet_reservations(self):
         arguments = (None, None, None, None, None, "adversarial", 4, 1)

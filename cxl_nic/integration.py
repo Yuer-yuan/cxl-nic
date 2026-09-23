@@ -38,7 +38,7 @@ TYPE2_DPA_BASE = 0x200000
 INITIAL = {0: 254, 1: 510}
 FIELDS = ("flow", "serial", "slot", "generation", "length")
 PINS = {"qemu": "59727bed3113942d6b7e1f61b1c08e02cc44e1c4",
-        "cxlmemsim": "652a75ef712ed06b19a3ae8f8b7dda57e9b44e9c"}
+        "cxlmemsim": "b5e183ea9732fa023c5df1a749a857430c3a237b"}
 
 
 def pattern(nonce, flow, serial, length):
@@ -118,6 +118,77 @@ def available_port():
         return sock.getsockname()[1]
 
 
+class GateController:
+    """Hold a host push flag between deterministic payload-line samples.
+
+    Sampling and control delay are counted in payload writes, not wall time or
+    CXL cycles. The immediate mode remains the original occupancy oracle.
+    """
+
+    def __init__(self, threshold, sample_every_lines=None, control_delay_lines=0):
+        if type(threshold) is not int or threshold < 0:
+            raise ValueError("gate threshold must be a nonnegative integer")
+        if (sample_every_lines is not None
+                and (type(sample_every_lines) is not int or sample_every_lines <= 0)):
+            raise ValueError("ncp_gate_sample_every_lines must be positive or None")
+        if type(control_delay_lines) is not int or control_delay_lines < 0:
+            raise ValueError("ncp_gate_control_delay_lines must be nonnegative")
+        if sample_every_lines is None and control_delay_lines:
+            raise ValueError("gate control delay requires sampled gating")
+        self.threshold = threshold
+        self.sample_every_lines = sample_every_lines
+        self.control_delay_lines = control_delay_lines
+        self.lines = 0
+        self.enabled = True
+        self.requested = True
+        self.pending = []
+        self.samples = 0
+        self.control_writes = 0
+        self.control_applies = 0
+        self.push_lines = 0
+        self.nc_write_lines = 0
+
+    def _apply_due(self):
+        while self.pending and self.pending[0][0] <= self.lines:
+            _, enabled = self.pending.pop(0)
+            self.enabled = enabled
+            self.control_applies += 1
+
+    def choose_push(self, resident_lines):
+        """Choose placement for the next line; query occupancy only on a sample."""
+        self._apply_due()
+        if self.sample_every_lines is None or self.lines % self.sample_every_lines == 0:
+            desired = resident_lines() < self.threshold
+            self.samples += 1
+            if self.sample_every_lines is None:
+                self.enabled = desired
+            elif desired != self.requested:
+                self.requested = desired
+                self.pending.append((self.lines + self.control_delay_lines, desired))
+                self.control_writes += 1
+                self._apply_due()
+        push = self.enabled
+        self.lines += 1
+        if push:
+            self.push_lines += 1
+        else:
+            self.nc_write_lines += 1
+        return push
+
+    def snapshot(self):
+        return {"mode": "instant" if self.sample_every_lines is None else "sampled_lines",
+                "control_path": "producer_controller_model",
+                "sample_every_payload_lines": self.sample_every_lines,
+                "control_delay_payload_lines": self.control_delay_lines,
+                "payload_lines": self.lines,
+                "samples": self.samples,
+                "control_writes": self.control_writes,
+                "control_applies": self.control_applies,
+                "pending_control_writes": len(self.pending),
+                "push_lines": self.push_lines,
+                "nc_write_lines": self.nc_write_lines}
+
+
 def qemu_command(binary, guest, device_type="type3", port=None):
     command = [str(binary), "-M", "sifive_u", "-machine",
                "cxl=on,cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=256M",
@@ -143,7 +214,8 @@ def qemu_command(binary, guest, device_type="type3", port=None):
 def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
              device_type="type3", data_path="legacy", llc_sets=64, llc_ways=8,
              ncp_post_push="none", ncp_gate_resident_lines=None,
-             global_push_credit_bytes=None):
+             global_push_credit_bytes=None, ncp_gate_sample_every_lines=None,
+             ncp_gate_control_delay_lines=0):
     if data_path not in ("legacy", "ncp", "ddio"):
         raise ValueError("data_path must be legacy, ncp, or ddio")
     if data_path in ("ncp", "ddio") and device_type != "type2":
@@ -159,6 +231,12 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
         raise ValueError("adaptive gating requires adversarial NC-P mode")
     if ncp_gate_resident_lines is not None and ncp_post_push != "none":
         raise ValueError("adaptive gating and post-push withdrawal are separate policies")
+    if ((ncp_gate_sample_every_lines is not None or ncp_gate_control_delay_lines)
+            and ncp_gate_resident_lines is None):
+        raise ValueError("gate sampling requires ncp_gate_resident_lines")
+    gate = (GateController(ncp_gate_resident_lines, ncp_gate_sample_every_lines,
+                           ncp_gate_control_delay_lines)
+            if ncp_gate_resident_lines is not None else None)
     if (global_push_credit_bytes is not None
             and (type(global_push_credit_bytes) is not int or global_push_credit_bytes < 1536)):
         raise ValueError("global_push_credit_bytes must fit one maximum-size packet")
@@ -182,6 +260,8 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
               "data_path": data_path,
               "ncp_post_push": ncp_post_push,
               "ncp_gate_resident_lines": ncp_gate_resident_lines,
+              "ncp_gate_sample_every_lines": ncp_gate_sample_every_lines,
+              "ncp_gate_control_delay_lines": ncp_gate_control_delay_lines,
               "global_push_credit_bytes": global_push_credit_bytes,
               "backend": ({"ncp": "explicit NC-P with NIC-memory backing",
                            "ddio": "modeled DDIO with host-memory backing"}[data_path]
@@ -221,6 +301,9 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
         lengths = (1500, 65, 64, 63, 1, 256)
         payloads = {f: {s: pattern(nonce, f, s, lengths[(s - start) % len(lengths)])
                         for s in range(start, start + count)} for f, start in INITIAL.items()}
+        result["payload_lines"] = sum((len(payload) + 63) // 64
+                                      for packets in payloads.values()
+                                      for payload in packets.values())
         remaining = {f: dict(packets) for f, packets in payloads.items()}
         bases = dict(INITIAL)
         freed = {f: set() for f in INITIAL}
@@ -234,8 +317,6 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
         held_progress = False
         withdrawn = set()
         withdrawal_lines = 0
-        gated_push_lines = 0
-        gated_nc_write_lines = 0
         rng = random.Random(0xC1A0)
 
         while True:
@@ -356,15 +437,11 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                     corruption_done = True
                     result["fault_injected"] = True
                 target_address = backend_address(address, device_type)
-                if (data_path == "ncp" and write.kind == "payload"
-                        and ncp_gate_resident_lines is not None):
-                    resident = client.query_ncp()["resident"]
-                    if resident < ncp_gate_resident_lines:
+                if data_path == "ncp" and write.kind == "payload" and gate is not None:
+                    if gate.choose_push(lambda: client.query_ncp()["resident"]):
                         client.ncp_write(target_address, data)
-                        gated_push_lines += 1
                     else:
                         client.ncp_nc_write(target_address, data)
-                        gated_nc_write_lines += 1
                 elif data_path != "legacy" and write.kind in ("payload", "ready"):
                     (client.ncp_write if data_path == "ncp" else client.ddio_write)(target_address, data)
                 else:
@@ -403,10 +480,35 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
         if data_path != "legacy":
             cache = (client.query_ncp if data_path == "ncp" else client.query_ddio)()
             cache.update(client.query_host_llc_traffic())
+            demand_by_kind = {kind: {"lines": 0, "hits": 0}
+                              for kind in ("payload", "ready")}
+            payload_span = ((max(lengths) + 63) // 64) * 64
+            for flow in INITIAL:
+                for slot in range(4):
+                    base = SLOT_BASE + (flow * 4 + slot) * SLOT_STRIDE
+                    for kind, offset, span in (("payload", PAYLOAD_OFFSET, payload_span),
+                                               ("ready", READY_OFFSET, 64)):
+                        observed = client.query_first_demands(
+                            backend_address(base + offset, device_type), span)
+                        demand_by_kind[kind]["lines"] += observed["lines"]
+                        demand_by_kind[kind]["hits"] += observed["hits"]
+            for observed in demand_by_kind.values():
+                observed["misses"] = observed["lines"] - observed["hits"]
+                observed["hit_rate"] = (observed["hits"] / observed["lines"]
+                                        if observed["lines"] else None)
+            if (sum(item["lines"] for item in demand_by_kind.values()) != cache["first_demands"]
+                    or sum(item["hits"] for item in demand_by_kind.values()) != cache["first_demand_hits"]):
+                raise RuntimeError("payload/ready first-demand ranges do not conserve LLC counters")
+            if (result["status"] == "passed"
+                    and (demand_by_kind["payload"]["lines"] != result["payload_lines"]
+                         or demand_by_kind["ready"]["lines"] != 2 * count)):
+                raise RuntimeError("successful guest did not demand every payload and ready line")
+            cache["payload_first_demand"] = demand_by_kind["payload"]
+            cache["ready_first_demand"] = demand_by_kind["ready"]
             cache.update(nc_writes=client.ncp_nc_writes,
                          nc_write_bytes=client.ncp_nc_write_bytes,
-                         gated_push_lines=gated_push_lines,
-                         gated_nc_write_lines=gated_nc_write_lines)
+                         gated_push_lines=gate.push_lines if gate is not None else 0,
+                         gated_nc_write_lines=gate.nc_write_lines if gate is not None else 0)
             completed = client.ncp_writes if data_path == "ncp" else client.ddio_writes
             result[data_path] = {**cache, "configured_sets": llc_sets,
                                  "configured_ways": llc_ways}
@@ -432,14 +534,16 @@ def run_case(directory, qemu, server, guest, topology, mode, count, timeout,
                     and (withdrawal_lines != client.ncp_nc_writes
                          or cache["first_demand_misses"] < withdrawal_lines)):
                 raise RuntimeError("post-push NC-write did not force payload fallback")
-            if (ncp_gate_resident_lines is not None
-                    and (not gated_push_lines or not gated_nc_write_lines
-                         or gated_nc_write_lines != client.ncp_nc_writes
-                         or cache["first_demand_misses"] < gated_nc_write_lines)):
+            if (gate is not None
+                    and (gate.lines != result["payload_lines"]
+                         or not gate.push_lines or not gate.nc_write_lines
+                         or gate.nc_write_lines != client.ncp_nc_writes
+                         or cache["first_demand_misses"] < gate.nc_write_lines)):
                 raise RuntimeError("adaptive gate did not exercise both push and NC-write")
             result["withdrawal_lines"] = withdrawal_lines
-            result["gate_decisions"] = {"push_lines": gated_push_lines,
-                                        "nc_write_lines": gated_nc_write_lines}
+            result["gate_decisions"] = {"push_lines": gate.push_lines if gate is not None else 0,
+                                        "nc_write_lines": gate.nc_write_lines if gate is not None else 0}
+            result["gate_sampling"] = gate.snapshot() if gate is not None else None
     except Exception as error:
         result.update(status="failed", error=repr(error))
         raise
@@ -488,6 +592,8 @@ def main(argv=None):
     parser.add_argument("--host-llc-ways", "--ncp-ways", dest="host_llc_ways", type=int, default=8)
     parser.add_argument("--ncp-post-push", choices=("none", "before-ready"), default="none")
     parser.add_argument("--ncp-gate-resident-lines", type=int)
+    parser.add_argument("--ncp-gate-sample-every-lines", type=int)
+    parser.add_argument("--ncp-gate-control-delay-lines", type=int, default=0)
     parser.add_argument("--global-push-credit-bytes", type=int)
     parser.add_argument("--case", choices=("all", "adversarial", "early-ready", "corrupt-payload"), default="all")
     args = parser.parse_args(argv)
@@ -503,6 +609,16 @@ def main(argv=None):
         parser.error("--ncp-gate-resident-lines requires --data-path ncp --case adversarial")
     if args.ncp_gate_resident_lines is not None and args.ncp_post_push != "none":
         parser.error("adaptive gating and post-push withdrawal are separate policies")
+    if ((args.ncp_gate_sample_every_lines is not None or args.ncp_gate_control_delay_lines)
+            and args.ncp_gate_resident_lines is None):
+        parser.error("gate sampling requires --ncp-gate-resident-lines")
+    if (args.ncp_gate_sample_every_lines is not None
+            and args.ncp_gate_sample_every_lines <= 0):
+        parser.error("--ncp-gate-sample-every-lines must be positive")
+    if args.ncp_gate_control_delay_lines < 0:
+        parser.error("--ncp-gate-control-delay-lines must be nonnegative")
+    if args.ncp_gate_sample_every_lines is None and args.ncp_gate_control_delay_lines:
+        parser.error("gate control delay requires sampled gating")
     if args.global_push_credit_bytes is not None and args.global_push_credit_bytes < 1536:
         parser.error("--global-push-credit-bytes must fit one maximum-size packet")
     if (args.case in ("all", "adversarial") and args.global_push_credit_bytes is not None
@@ -518,6 +634,8 @@ def main(argv=None):
               "data_path": args.data_path,
               "ncp_post_push": args.ncp_post_push,
               "ncp_gate_resident_lines": args.ncp_gate_resident_lines,
+              "ncp_gate_sample_every_lines": args.ncp_gate_sample_every_lines,
+              "ncp_gate_control_delay_lines": args.ncp_gate_control_delay_lines,
               "global_push_credit_bytes": args.global_push_credit_bytes,
               "scope": (f"RISC-V guest functional publication over {args.device_type.capitalize()} "
                         + ("explicit finite simulated host LLC; no physical LLC/ISA proof"
@@ -547,7 +665,9 @@ def main(argv=None):
                             mode, args.packets_per_flow, args.timeout, args.device_type,
                             args.data_path, args.host_llc_sets, args.host_llc_ways,
                             args.ncp_post_push, args.ncp_gate_resident_lines,
-                            args.global_push_credit_bytes)
+                            args.global_push_credit_bytes,
+                            args.ncp_gate_sample_every_lines,
+                            args.ncp_gate_control_delay_lines)
             result["cases"].append(case)
         result["status"] = "passed"
     except Exception as error:

@@ -122,6 +122,26 @@ class TransportTests(unittest.TestCase):
             "writebacks": 1, "resident": 5, "query_latency_ns": 17,
             "host_read_misses": 2, "first_demand_misses": 1})
 
+    def test_first_demand_range_query_preserves_address_and_hit_count(self):
+        client, stream = self.make_client([response(struct.pack("<QQ", 4, 3))])
+        self.assertEqual(client.query_first_demands(64, 64),
+                         {"lines": 4, "hits": 3, "misses": 1, "hit_rate": 0.75})
+        request = stream.sent[0]
+        self.assertEqual(request[0], 27)
+        self.assertEqual(int.from_bytes(request[1:9], "little"), 64)
+        self.assertEqual(int.from_bytes(request[25:33], "little"), 64)
+        for address, length in ((1, 64), (64, 1), (64, 0), (64, 128),
+                                (True, 64), (64, True)):
+            with self.subTest(address=address, length=length), self.assertRaises(ValueError):
+                client.query_first_demands(address, length)
+        self.assertEqual(len(stream.sent), 1)
+
+    def test_first_demand_range_query_rejects_impossible_hits(self):
+        client, stream = self.make_client([response(struct.pack("<QQ", 1, 2))])
+        with self.assertRaisesRegex(TransportError, "more first-demand hits"):
+            client.query_first_demands(0, 64)
+        self.assertEqual(stream.close_count, 1)
+
     def test_ncp_rejects_invalid_configuration_and_write_before_sending(self):
         client, stream = self.make_client()
         for sets, ways in ((0, 1), (1, 0), (True, 1), (1, True),

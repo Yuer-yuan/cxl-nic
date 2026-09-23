@@ -16,6 +16,7 @@ OP_DDIO_WRITE = 23
 OP_DDIO_QUERY = 24
 OP_HOST_LLC_TRAFFIC_QUERY = 25
 OP_NCP_NC_WRITE = 26
+OP_NCP_DEMAND_RANGE_QUERY = 27
 
 
 class TransportError(RuntimeError):
@@ -150,6 +151,19 @@ class Client:
 
     def query_ddio(self):
         return self._query_host_llc(OP_DDIO_QUERY)
+
+    def query_first_demands(self, address, length):
+        if (type(address) is not int or type(length) is not int
+                or address < 0 or address % 64 or length <= 0 or length % 64
+                or length > 1 << 20 or address + length > self.capacity):
+            raise ValueError("first-demand range must be aligned, nonempty and within capacity")
+        _, _, data = self._exchange(OP_NCP_DEMAND_RANGE_QUERY, address=address, value=length)
+        demands, hits = struct.unpack_from("<QQ", data)
+        if hits > demands:
+            self.close()
+            raise TransportError("server returned more first-demand hits than demands")
+        return {"lines": demands, "hits": hits, "misses": demands - hits,
+                "hit_rate": hits / demands if demands else None}
 
     def query_host_llc_traffic(self):
         _, _, data = self._exchange(OP_HOST_LLC_TRAFFIC_QUERY)

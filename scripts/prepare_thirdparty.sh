@@ -20,7 +20,9 @@ prepare() {
     if [[ ! -e "$destination/.git" ]]; then
         git clone --depth 1 --no-local --no-checkout "$source" "$destination"
         if ! git -C "$destination" cat-file -e "$revision^{commit}"; then
-            git -C "$destination" fetch --depth 1 origin "$revision"
+            if ! git -C "$destination" fetch --depth 1 origin "$revision"; then
+                git -C "$destination" fetch --depth 1 "$origin" "$revision"
+            fi
         fi
         git -C "$destination" checkout --detach "$revision"
         git -C "$destination" remote set-url origin "$origin"
@@ -49,4 +51,4 @@ prepare() {
 }
 
 prepare qemu 59727bed3113942d6b7e1f61b1c08e02cc44e1c4 git@github.com:Yuer-yuan/qemu-cxl-type2.git
-prepare cxlmemsim 652a75ef712ed06b19a3ae8f8b7dda57e9b44e9c git@github.com:Yuer-yuan/CXLMemSim.git
+prepare cxlmemsim b5e183ea9732fa023c5df1a749a857430c3a237b git@github.com:Yuer-yuan/CXLMemSim.git
